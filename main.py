@@ -1,5 +1,6 @@
 import os
 import sys
+import re
 import json
 import time
 import aiohttp
@@ -39,6 +40,7 @@ try:
     MAX_RETRIES      = 3
     VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v")
     USER_API_FILE    = "user_apis.json"
+    CHANNEL_FILE     = "user_channels.json"
     TERABOX_API_URL  = "https://xapiverse.com/api/terabox"
 
     TERABOX_DOMAINS = (
@@ -48,17 +50,12 @@ try:
     )
 
     # ── State tracking ────────────────────────────────────────────────────
-    # { user_id: {"step": "label"|"key", "label": "নামটি"} }
+    # { user_id: {"step": "key"|"add_channel"} }
     waiting_state: dict = {}
 
-    # ── Storage helpers ───────────────────────────────────────────────────
-    # ফরম্যাট:
-    # {
-    #   "user_id": {
-    #     "active": "label1",
-    #     "keys": { "label1": "sk_xxx", "label2": "sk_yyy" }
-    #   }
-    # }
+    # ════════════════════════════════════════════════════════════════════════
+    # USER API STORAGE
+    # ════════════════════════════════════════════════════════════════════════
 
     def load_data() -> dict:
         if os.path.exists(USER_API_FILE):
@@ -76,7 +73,6 @@ try:
     def get_user_data(user_id: int) -> dict:
         data = load_data()
         raw = data.get(str(user_id), {"active": None, "keys": {}})
-        # পুরনো ফরম্যাট: সরাসরি string ছিল → নতুন ফরম্যাটে মাইগ্রেট করো
         if isinstance(raw, str):
             migrated = {"active": "default", "keys": {"default": raw}}
             data[str(user_id)] = migrated
@@ -125,8 +121,52 @@ try:
             return "****"
         return key[:4] + "****" + key[-4:]
 
-    # ── Keyboards ─────────────────────────────────────────────────────────
-    def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    # ════════════════════════════════════════════════════════════════════════
+    # CHANNEL STORAGE
+    # ════════════════════════════════════════════════════════════════════════
+    # ফরম্যাট: {"user_id": [{"id": -1001234, "title": "Channel Name"}]}
+
+    def load_channels() -> dict:
+        if os.path.exists(CHANNEL_FILE):
+            try:
+                with open(CHANNEL_FILE, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save_channels(data: dict):
+        with open(CHANNEL_FILE, "w") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def get_user_channels(user_id: int) -> list:
+        data = load_channels()
+        return data.get(str(user_id), [])
+
+    def add_user_channel(user_id: int, channel_id: int, title: str) -> bool:
+        data = load_channels()
+        uid = str(user_id)
+        if uid not in data:
+            data[uid] = []
+        for ch in data[uid]:
+            if ch["id"] == channel_id:
+                return False  # ইতিমধ্যেই আছে
+        data[uid].append({"id": channel_id, "title": title})
+        save_channels(data)
+        return True
+
+    def delete_user_channel(user_id: int, channel_id: int):
+        data = load_channels()
+        uid = str(user_id)
+        if uid in data:
+            data[uid] = [ch for ch in data[uid] if ch["id"] != channel_id]
+            save_channels(data)
+
+    # ════════════════════════════════════════════════════════════════════════
+    # KEYBOARDS — API
+    # ════════════════════════════════════════════════════════════════════════
+
+    def api_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
         udata = get_user_data(user_id)
         keys = udata.get("keys", {})
         buttons = [
@@ -152,12 +192,7 @@ try:
         buttons.append([InlineKeyboardButton("🔙 পিছনে যান", callback_data="api_menu")])
         return InlineKeyboardMarkup(buttons)
 
-    def back_keyboard() -> InlineKeyboardMarkup:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 পিছনে যান", callback_data="api_menu")]
-        ])
-
-    def menu_text(user_id: int) -> str:
+    def api_menu_text(user_id: int) -> str:
         udata = get_user_data(user_id)
         keys = udata.get("keys", {})
         active = udata.get("active")
@@ -167,15 +202,76 @@ try:
             active_key = keys.get(active, "")
             status = (
                 f"✅ **{len(keys)}টি** API Key সেভ আছে।\n"
-                f"🟢 Active: **{active}** (`{mask_key(active_key)}`)\n"
-                "এই Key দিয়ে Terabox ডাউনলোড হচ্ছে।"
+                f"🟢 Active: **{active}** (`{mask_key(active_key)}`)"
             )
         return f"⚙️ **Terabox API Key ম্যানেজমেন্ট**\n\n{status}"
 
-    # ── Terabox ───────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # KEYBOARDS — CHANNEL
+    # ════════════════════════════════════════════════════════════════════════
+
+    def channel_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
+        channels = get_user_channels(user_id)
+        buttons = [
+            [InlineKeyboardButton("➕ চ্যানেল যোগ করুন", callback_data="ch_add")],
+        ]
+        if channels:
+            buttons.append([InlineKeyboardButton("📋 সেভ করা চ্যানেল দেখুন", callback_data="ch_list")])
+            buttons.append([InlineKeyboardButton("🗑️ চ্যানেল মুছুন", callback_data="ch_delete_list")])
+        return InlineKeyboardMarkup(buttons)
+
+    def channel_delete_keyboard(user_id: int) -> InlineKeyboardMarkup:
+        channels = get_user_channels(user_id)
+        buttons = []
+        for ch in channels:
+            buttons.append([InlineKeyboardButton(
+                f"🗑️ {ch['title']}", callback_data=f"ch_del:{ch['id']}"
+            )])
+        buttons.append([InlineKeyboardButton("🔙 পিছনে যান", callback_data="ch_menu")])
+        return InlineKeyboardMarkup(buttons)
+
+    def back_ch_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 পিছনে যান", callback_data="ch_menu")]
+        ])
+
+    def back_api_keyboard() -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 পিছনে যান", callback_data="api_menu")]
+        ])
+
+    def channel_menu_text(user_id: int) -> str:
+        channels = get_user_channels(user_id)
+        if not channels:
+            status = "❌ কোনো চ্যানেল সেভ নেই।"
+        else:
+            lines = [f"✅ **{len(channels)}টি** চ্যানেল সেভ আছে:"]
+            for ch in channels:
+                lines.append(f"• {ch['title']} (`{ch['id']}`)")
+            status = "\n".join(lines)
+        return f"📢 **চ্যানেল ম্যানেজমেন্ট**\n\n{status}"
+
+    # ════════════════════════════════════════════════════════════════════════
+    # HELPERS
+    # ════════════════════════════════════════════════════════════════════════
+
     def is_terabox_url(url: str) -> bool:
         url_lower = url.lower()
         return any(domain in url_lower for domain in TERABOX_DOMAINS)
+
+    def extract_terabox_url(text: str) -> str | None:
+        """টেক্সট থেকে Terabox URL বের করো।"""
+        if not text:
+            return None
+        for word in re.split(r'\s+', text):
+            word = word.strip(".,;:!?\"'()[]")
+            if word.startswith(("http://", "https://")) and is_terabox_url(word):
+                return word
+        return None
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TERABOX API
+    # ════════════════════════════════════════════════════════════════════════
 
     async def get_terabox_info(url: str, api_key: str):
         if not api_key:
@@ -231,7 +327,10 @@ try:
         except Exception as e:
             return False, f"Terabox API এরর: {str(e)}"
 
-    # ── ZIP ───────────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # ZIP
+    # ════════════════════════════════════════════════════════════════════════
+
     def find_videos_in_zip(extract_dir: str):
         videos = []
         for root, dirs, files in os.walk(extract_dir):
@@ -242,7 +341,10 @@ try:
         videos.sort(key=lambda x: os.path.getsize(x[0]), reverse=True)
         return videos
 
-    # ── Download ──────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # DOWNLOAD
+    # ════════════════════════════════════════════════════════════════════════
+
     async def download_file(url: str, save_path: str, status_msg):
         timeout = aiohttp.ClientTimeout(connect=30, sock_read=120, total=None)
         req_headers = {
@@ -322,7 +424,59 @@ try:
         )
         await status_msg.delete()
 
-    # ── Commands ──────────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # CHANNEL POST HELPER
+    # ════════════════════════════════════════════════════════════════════════
+
+    async def post_to_channels(client, user_id: int, channels: list, status_msg,
+                                photo_file_id=None, video_file_id=None,
+                                original_caption="", downloaded_video_path=None,
+                                downloaded_video_name=""):
+        """
+        সেভ করা সব চ্যানেলে মিডিয়া ও ডাউনলোড করা ভিডিও পোস্ট করো।
+        """
+        success_count = 0
+        fail_msgs = []
+
+        for ch in channels:
+            ch_id = ch["id"]
+            ch_title = ch["title"]
+            try:
+                # ১. অরিজিনাল মিডিয়া পোস্ট করো
+                if photo_file_id:
+                    await client.send_photo(
+                        chat_id=ch_id,
+                        photo=photo_file_id,
+                        caption=original_caption,
+                    )
+                elif video_file_id:
+                    await client.send_video(
+                        chat_id=ch_id,
+                        video=video_file_id,
+                        caption=original_caption,
+                        supports_streaming=True,
+                    )
+
+                # ২. ডাউনলোড করা Terabox ভিডিও পোস্ট করো
+                if downloaded_video_path and os.path.exists(downloaded_video_path):
+                    size_mb = os.path.getsize(downloaded_video_path) / (1024 * 1024)
+                    await client.send_video(
+                        chat_id=ch_id,
+                        video=downloaded_video_path,
+                        caption=f"🎬 {downloaded_video_name}\nআকার: {size_mb:.2f} MB",
+                        supports_streaming=True,
+                    )
+                success_count += 1
+            except Exception as e:
+                fail_msgs.append(f"❌ {ch_title}: {str(e)}")
+                print(f"Channel post error ({ch_title}): {e}", flush=True)
+
+        return success_count, fail_msgs
+
+    # ════════════════════════════════════════════════════════════════════════
+    # COMMANDS
+    # ════════════════════════════════════════════════════════════════════════
+
     @app.on_message(filters.command("start"))
     async def start_cmd(client, message: Message):
         await message.reply_text(
@@ -331,7 +485,8 @@ try:
             "🎬 ডাইরেক্ট MP4/ভিডিও লিংক\n"
             "📦 ZIP ফাইল লিংক (ভেতরে MP4 থাকলে)\n"
             "☁️ Terabox লিংক\n\n"
-            "⚙️ নিজের Terabox API Key ম্যানেজ করতে /api কমান্ড দিন।\n\n"
+            "⚙️ Terabox API Key ম্যানেজ করতে: /api\n"
+            "📢 চ্যানেল ম্যানেজ করতে: /channel\n\n"
             "আমি ডাউনলোড করে ভিডিও হিসেবে পাঠিয়ে দেবো। 🚀"
         )
 
@@ -339,8 +494,16 @@ try:
     async def api_cmd(client, message: Message):
         user_id = message.from_user.id
         await message.reply_text(
-            menu_text(user_id),
-            reply_markup=main_menu_keyboard(user_id),
+            api_menu_text(user_id),
+            reply_markup=api_main_keyboard(user_id),
+        )
+
+    @app.on_message(filters.command("channel"))
+    async def channel_cmd(client, message: Message):
+        user_id = message.from_user.id
+        await message.reply_text(
+            channel_menu_text(user_id),
+            reply_markup=channel_main_keyboard(user_id),
         )
 
     @app.on_message(filters.command("cancel"))
@@ -352,30 +515,31 @@ try:
         else:
             await message.reply_text("কোনো সক্রিয় অপেক্ষা নেই।")
 
-    # ── Callback Queries ──────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # CALLBACK QUERIES
+    # ════════════════════════════════════════════════════════════════════════
+
     @app.on_callback_query()
     async def callback_handler(client, callback: CallbackQuery):
         user_id = callback.from_user.id
         data = callback.data
 
-        # মেইন মেনু
+        # ── API Callbacks ─────────────────────────────────────────────────
         if data == "api_menu":
             await callback.message.edit_text(
-                menu_text(user_id),
-                reply_markup=main_menu_keyboard(user_id),
+                api_menu_text(user_id), reply_markup=api_main_keyboard(user_id)
             )
-
-        # নতুন Key যোগ — সরাসরি key চাও
         elif data == "api_add":
             waiting_state[user_id] = {"step": "key"}
             await callback.message.edit_text(
-                "✏️ **xapiverse.com এর API Key পাঠান**\n\n"
-                "উদাহরণ: `sk_43dcbaa7528c97b30b7d9b43f6b26f07`\n\n"
+                "✏️ **নতুন API Key এর নাম দিন**\n\n"
+                "প্রথমে একটি নাম পাঠান (যেমন: `personal`, `work`, `mykey1`)\n"
                 "বাতিল করতে /cancel লিখুন।",
                 reply_markup=None,
             )
+            # দুই ধাপ: প্রথমে নাম, তারপর key
+            waiting_state[user_id] = {"step": "label"}
 
-        # সব Key তালিকা
         elif data == "api_list":
             udata = get_user_data(user_id)
             keys = udata.get("keys", {})
@@ -388,101 +552,277 @@ try:
                     mark = "🟢 " if label == active else "⚪️ "
                     lines.append(f"{mark}**{label}**: `{mask_key(key_val)}`")
                 text = "\n".join(lines)
-            await callback.message.edit_text(text, reply_markup=back_keyboard())
+            await callback.message.edit_text(text, reply_markup=back_api_keyboard())
 
-        # Active Key পরিবর্তন — Key সিলেক্ট করো
         elif data == "api_switch":
             udata = get_user_data(user_id)
-            keys = udata.get("keys", {})
-            if not keys:
-                await callback.message.edit_text(
-                    "❌ কোনো Key নেই। আগে যোগ করুন।",
-                    reply_markup=back_keyboard(),
-                )
+            if not udata.get("keys"):
+                await callback.message.edit_text("❌ কোনো Key নেই।", reply_markup=back_api_keyboard())
             else:
                 await callback.message.edit_text(
-                    "🔄 **কোন Key Active করবেন?**\n"
-                    "✅ চিহ্নিতটি এখন Active।",
+                    "🔄 **কোন Key Active করবেন?**\n✅ চিহ্নিতটি এখন Active।",
                     reply_markup=keys_select_keyboard(user_id, "switch"),
                 )
 
-        # Active Key সেট করো
         elif data.startswith("switch:"):
             label = data.split(":", 1)[1]
             set_active_key(user_id, label)
             await callback.message.edit_text(
-                f"✅ **{label}** এখন Active Key হিসেবে সেট হয়েছে।",
-                reply_markup=back_keyboard(),
+                f"✅ **{label}** এখন Active Key।",
+                reply_markup=back_api_keyboard(),
             )
 
-        # মুছার তালিকা
         elif data == "api_delete_list":
             udata = get_user_data(user_id)
-            keys = udata.get("keys", {})
-            if not keys:
-                await callback.message.edit_text(
-                    "❌ কোনো Key নেই।",
-                    reply_markup=back_keyboard(),
-                )
+            if not udata.get("keys"):
+                await callback.message.edit_text("❌ কোনো Key নেই।", reply_markup=back_api_keyboard())
             else:
                 await callback.message.edit_text(
-                    "🗑️ **কোন Key মুছতে চান?**\nক্লিক করলেই মুছে যাবে।",
+                    "🗑️ **কোন Key মুছতে চান?**",
                     reply_markup=keys_select_keyboard(user_id, "del"),
                 )
 
-        # নির্দিষ্ট Key মুছো
         elif data.startswith("del:"):
             label = data.split(":", 1)[1]
             delete_user_key(user_id, label)
             udata = get_user_data(user_id)
-            keys = udata.get("keys", {})
             await callback.message.edit_text(
                 f"🗑️ **{label}** মুছে ফেলা হয়েছে।",
                 reply_markup=(
                     keys_select_keyboard(user_id, "del")
-                    if keys else back_keyboard()
+                    if udata.get("keys") else back_api_keyboard()
                 ),
             )
 
-        # সাহায্য
         elif data == "api_help":
             await callback.message.edit_text(
                 "❓ **Terabox API Key কোথায় পাবেন?**\n\n"
                 "১. [xapiverse.com](https://xapiverse.com) এ যান\n"
                 "২. রেজিস্ট্রেশন করুন\n"
                 "৩. Dashboard থেকে API Key কপি করুন\n"
-                "৪. বটে /api দিয়ে **➕ নতুন API Key যোগ করুন** চাপুন\n\n"
-                "নিজের Key ব্যবহার করলে আলাদা limit ও speed পাবেন।",
-                reply_markup=back_keyboard(),
+                "৪. বটে /api দিয়ে **➕ নতুন API Key যোগ করুন** চাপুন",
+                reply_markup=back_api_keyboard(),
+            )
+
+        # ── Channel Callbacks ─────────────────────────────────────────────
+        elif data == "ch_menu":
+            await callback.message.edit_text(
+                channel_menu_text(user_id), reply_markup=channel_main_keyboard(user_id)
+            )
+
+        elif data == "ch_add":
+            waiting_state[user_id] = {"step": "add_channel"}
+            await callback.message.edit_text(
+                "📢 **চ্যানেল যোগ করুন**\n\n"
+                "দুটি উপায়ে চ্যানেল যোগ করতে পারবেন:\n\n"
+                "১. চ্যানেল থেকে যেকোনো পোস্ট **ফরওয়ার্ড** করুন\n"
+                "২. চ্যানেলের **ID** পাঠান (যেমন: `-1001234567890`)\n\n"
+                "⚠️ বটকে অবশ্যই চ্যানেলের Admin করতে হবে।\n"
+                "বাতিল করতে /cancel লিখুন।",
+                reply_markup=None,
+            )
+
+        elif data == "ch_list":
+            channels = get_user_channels(user_id)
+            if not channels:
+                text = "📋 কোনো চ্যানেল সেভ নেই।"
+            else:
+                lines = ["📋 **সেভ করা চ্যানেলগুলো:**\n"]
+                for ch in channels:
+                    lines.append(f"• **{ch['title']}**\nID: `{ch['id']}`")
+                text = "\n\n".join(lines)
+            await callback.message.edit_text(text, reply_markup=back_ch_keyboard())
+
+        elif data == "ch_delete_list":
+            channels = get_user_channels(user_id)
+            if not channels:
+                await callback.message.edit_text("❌ কোনো চ্যানেল নেই।", reply_markup=back_ch_keyboard())
+            else:
+                await callback.message.edit_text(
+                    "🗑️ **কোন চ্যানেল মুছতে চান?**",
+                    reply_markup=channel_delete_keyboard(user_id),
+                )
+
+        elif data.startswith("ch_del:"):
+            ch_id = int(data.split(":", 1)[1])
+            delete_user_channel(user_id, ch_id)
+            channels = get_user_channels(user_id)
+            await callback.message.edit_text(
+                "🗑️ চ্যানেল মুছে ফেলা হয়েছে।",
+                reply_markup=(
+                    channel_delete_keyboard(user_id) if channels else back_ch_keyboard()
+                ),
             )
 
         await callback.answer()
 
-    # ── Text Handler ──────────────────────────────────────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    # FORWARDED MEDIA HANDLER (photo বা video সহ ফরওয়ার্ড)
+    # ════════════════════════════════════════════════════════════════════════
+
+    @app.on_message(filters.forwarded & (filters.photo | filters.video))
+    async def handle_forwarded_media(client, message: Message):
+        user_id = message.from_user.id
+
+        # ── চ্যানেল যোগের মোডে আছে? ─────────────────────────────────────
+        if user_id in waiting_state and waiting_state[user_id].get("step") == "add_channel":
+            waiting_state.pop(user_id, None)
+            fwd_chat = message.forward_from_chat
+            if not fwd_chat:
+                await message.reply_text(
+                    "❌ এই পোস্ট থেকে চ্যানেল ID পাওয়া যায়নি।\n"
+                    "চ্যানেলের Privacy setting বন্ধ থাকতে পারে।\n"
+                    "চ্যানেল ID সরাসরি পাঠান।"
+                )
+                return
+            added = add_user_channel(user_id, fwd_chat.id, fwd_chat.title or str(fwd_chat.id))
+            if added:
+                await message.reply_text(
+                    f"✅ **{fwd_chat.title}** চ্যানেল সেভ হয়েছে!\n"
+                    f"ID: `{fwd_chat.id}`\n\n"
+                    "এখন Terabox+মিডিয়া পোস্ট ফরওয়ার্ড করলে এই চ্যানেলে পোস্ট হবে।",
+                    reply_markup=channel_main_keyboard(user_id),
+                )
+            else:
+                await message.reply_text(
+                    f"⚠️ **{fwd_chat.title}** চ্যানেল আগেই সেভ আছে।",
+                    reply_markup=channel_main_keyboard(user_id),
+                )
+            return
+
+        # ── Terabox লিংক আছে? ────────────────────────────────────────────
+        caption = message.caption or ""
+        terabox_url = extract_terabox_url(caption)
+        if not terabox_url:
+            return  # Terabox লিংক নেই, এড়িয়ে যাও
+
+        channels = get_user_channels(user_id)
+        if not channels:
+            await message.reply_text(
+                "❌ কোনো চ্যানেল সেভ নেই।\n"
+                "/channel দিয়ে চ্যানেল যোগ করুন।"
+            )
+            return
+
+        status_msg = await message.reply_text(
+            f"📢 Terabox পোস্ট শনাক্ত হয়েছে!\n"
+            f"🔄 {len(channels)}টি চ্যানেলে পোস্ট করা হবে..."
+        )
+
+        uid = f"{user_id}_{int(time.time())}"
+        active_key = get_active_key(user_id) or DEFAULT_TERABOX_KEY
+
+        # ── Photo/Video file_id সংগ্রহ ────────────────────────────────────
+        photo_file_id = None
+        video_file_id = None
+        if message.photo:
+            photo_file_id = message.photo.file_id
+        elif message.video:
+            video_file_id = message.video.file_id
+
+        # ── Terabox ডাউনলোড ───────────────────────────────────────────────
+        await status_msg.edit_text("☁️ Terabox ভিডিও ডাউনলোড হচ্ছে...")
+        ok, info = await get_terabox_info(terabox_url, active_key)
+        if not ok:
+            await status_msg.edit_text(
+                f"❌ Terabox ডাউনলোড ব্যর্থ!\n{info}\n\n"
+                "💡 নিজের API Key যোগ করতে /api দিন।"
+            )
+            return
+
+        total_files = len(info)
+        posted_channels = 0
+
+        for i, file_info in enumerate(info, 1):
+            dl_url    = file_info["download_url"]
+            file_name = file_info["file_name"]
+            dl_path   = f"ch_{uid}_{i}.mp4"
+
+            try:
+                await status_msg.edit_text(
+                    f"⬇️ ডাউনলোড হচ্ছে ({i}/{total_files}): {file_name}"
+                )
+                success, result = await download_file(dl_url, dl_path, status_msg)
+                if not success:
+                    await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ: {result}")
+                    continue
+
+                await status_msg.edit_text(
+                    f"⬆️ {len(channels)}টি চ্যানেলে পোস্ট হচ্ছে..."
+                )
+
+                # শুধুমাত্র প্রথম ভিডিওর সাথে অরিজিনাল মিডিয়া পাঠাও
+                send_original = (i == 1)
+                ok_count, fail_list = await post_to_channels(
+                    client, user_id, channels, status_msg,
+                    photo_file_id=photo_file_id if send_original else None,
+                    video_file_id=video_file_id if send_original else None,
+                    original_caption=caption if send_original else "",
+                    downloaded_video_path=dl_path,
+                    downloaded_video_name=file_name,
+                )
+                posted_channels += ok_count
+
+                if fail_list:
+                    for fm in fail_list:
+                        print(fm, flush=True)
+
+            finally:
+                if os.path.exists(dl_path):
+                    os.remove(dl_path)
+
+        ch_names = ", ".join(ch["title"] for ch in channels)
+        await status_msg.edit_text(
+            f"✅ **সম্পন্ন!**\n\n"
+            f"📢 চ্যানেল: {ch_names}\n"
+            f"🎬 পোস্ট করা হয়েছে: {total_files}টি ভিডিও"
+        )
+
+    # ════════════════════════════════════════════════════════════════════════
+    # TEXT HANDLER
+    # ════════════════════════════════════════════════════════════════════════
+
     @app.on_message(filters.text & ~filters.regex(r"^/"))
     async def handle_text(client, message: Message):
         user_id = message.from_user.id
         text = message.text.strip()
 
-        # ── API Key ইনপুট ────────────────────────────────────────────────
+        # ── Waiting state ─────────────────────────────────────────────────
         if user_id in waiting_state:
             state = waiting_state[user_id]
 
-            if state["step"] == "key":
+            # API Key: ধাপ ১ — নাম
+            if state["step"] == "label":
+                label = text.strip()
+                if len(label) < 1 or len(label) > 30:
+                    await message.reply_text(
+                        "❌ নামটি ১–৩০ অক্ষরের মধ্যে হতে হবে। আবার লিখুন।\n"
+                        "বাতিল করতে /cancel।"
+                    )
+                    return
+                waiting_state[user_id] = {"step": "key", "label": label}
+                await message.reply_text(
+                    f"✅ নাম: **{label}**\n\n"
+                    "এখন xapiverse.com এর API Key পাঠান:\n"
+                    "বাতিল করতে /cancel।"
+                )
+                return
+
+            # API Key: ধাপ ২ — key
+            elif state["step"] == "key":
                 api_key = text.strip()
+                label = state.get("label")
                 waiting_state.pop(user_id, None)
 
                 if len(api_key) < 10:
                     await message.reply_text(
-                        "❌ API Key টি সঠিক মনে হচ্ছে না (অনেক ছোট)।\n"
-                        "আবার /api দিয়ে চেষ্টা করুন।"
+                        "❌ API Key টি সঠিক মনে হচ্ছে না।\nআবার /api দিয়ে চেষ্টা করুন।"
                     )
                     return
 
-                # অটো-লেবেল: API 1, API 2, ...
-                udata = get_user_data(user_id)
-                existing = udata.get("keys", {})
-                label = f"API {len(existing) + 1}"
+                if not label:
+                    udata = get_user_data(user_id)
+                    label = f"API {len(udata.get('keys', {})) + 1}"
 
                 add_user_key(user_id, label, api_key)
                 await message.reply_text(
@@ -490,8 +830,57 @@ try:
                     f"🏷️ নাম: **{label}**\n"
                     f"🔑 Key: `{mask_key(api_key)}`\n\n"
                     "এখন এই Key টি Active আছে।",
-                    reply_markup=main_menu_keyboard(user_id),
+                    reply_markup=api_main_keyboard(user_id),
                 )
+                return
+
+            # চ্যানেল যোগ — টেক্সট দিয়ে (ID বা @username বা ফরওয়ার্ড)
+            elif state["step"] == "add_channel":
+
+                # ফরওয়ার্ড করা টেক্সট মেসেজ
+                if message.forward_from_chat:
+                    waiting_state.pop(user_id, None)
+                    fwd_chat = message.forward_from_chat
+                    added = add_user_channel(user_id, fwd_chat.id, fwd_chat.title or str(fwd_chat.id))
+                    if added:
+                        await message.reply_text(
+                            f"✅ **{fwd_chat.title}** চ্যানেল সেভ হয়েছে!\n"
+                            f"ID: `{fwd_chat.id}`",
+                            reply_markup=channel_main_keyboard(user_id),
+                        )
+                    else:
+                        await message.reply_text(
+                            f"⚠️ এই চ্যানেল আগেই সেভ আছে।",
+                            reply_markup=channel_main_keyboard(user_id),
+                        )
+                    return
+
+                # সরাসরি ID বা @username
+                channel_input = text.strip()
+                waiting_state.pop(user_id, None)
+
+                try:
+                    chat = await client.get_chat(channel_input)
+                    added = add_user_channel(user_id, chat.id, chat.title or channel_input)
+                    if added:
+                        await message.reply_text(
+                            f"✅ **{chat.title}** চ্যানেল সেভ হয়েছে!\n"
+                            f"ID: `{chat.id}`\n\n"
+                            "⚠️ নিশ্চিত করুন বট চ্যানেলের Admin আছে।",
+                            reply_markup=channel_main_keyboard(user_id),
+                        )
+                    else:
+                        await message.reply_text(
+                            "⚠️ এই চ্যানেল আগেই সেভ আছে।",
+                            reply_markup=channel_main_keyboard(user_id),
+                        )
+                except Exception as e:
+                    await message.reply_text(
+                        f"❌ চ্যানেল খুঁজে পাওয়া যায়নি।\n`{str(e)}`\n\n"
+                        "নিশ্চিত করুন:\n"
+                        "• বটকে চ্যানেলে Admin হিসেবে যোগ করা হয়েছে\n"
+                        "• ID বা @username সঠিক আছে"
+                    )
                 return
 
         # ── URL হ্যান্ডেলিং ───────────────────────────────────────────────
@@ -514,14 +903,10 @@ try:
                 active_key = get_active_key(user_id) or DEFAULT_TERABOX_KEY
                 udata = get_user_data(user_id)
                 active_label = udata.get("active")
-                if get_active_key(user_id):
-                    key_label = f"🔑 {active_label}"
-                else:
-                    key_label = "🌐 ডিফল্ট API"
+                key_label = f"🔑 {active_label}" if get_active_key(user_id) else "🌐 ডিফল্ট API"
 
                 await status_msg.edit_text(
-                    f"☁️ Terabox লিংক শনাক্ত হয়েছে!\n"
-                    f"ব্যবহার হচ্ছে: {key_label}\n"
+                    f"☁️ Terabox লিংক শনাক্ত হয়েছে!\nব্যবহার হচ্ছে: {key_label}\n"
                     "🔍 তথ্য সংগ্রহ করা হচ্ছে..."
                 )
 
@@ -529,26 +914,22 @@ try:
                 if not ok:
                     await status_msg.edit_text(
                         f"❌ Terabox লিংক প্রসেস করতে ব্যর্থ!\n{info}\n\n"
-                        "💡 নিজের API Key যোগ করতে /api কমান্ড দিন।"
+                        "💡 নিজের API Key যোগ করতে /api দিন।"
                     )
                     return
 
-                file_list = info
-                total = len(file_list)
-
-                for i, file_info in enumerate(file_list, 1):
+                for i, file_info in enumerate(info, 1):
                     dl_url    = file_info["download_url"]
                     file_name = file_info["file_name"]
                     dl_path   = f"terabox_{uid}_{i}.mp4"
+                    total     = len(info)
 
                     await status_msg.edit_text(
                         f"📄 ফাইল ({i}/{total}): {file_name}\n⬇️ ডাউনলোড শুরু হচ্ছে..."
                     )
                     success, result = await download_file(dl_url, dl_path, status_msg)
                     if not success:
-                        await status_msg.edit_text(
-                            f"❌ ডাউনলোড ব্যর্থ ({file_name})!\n{result}"
-                        )
+                        await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ ({file_name})!\n{result}")
                         continue
                     try:
                         size_mb = os.path.getsize(dl_path) / (1024 * 1024)
