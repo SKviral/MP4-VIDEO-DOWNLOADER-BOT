@@ -81,58 +81,51 @@ try:
             if not data:
                 return False, "API থেকে কোনো রেসপন্স আসেনি।"
 
-            # বিভিন্ন রেসপন্স ফরম্যাট হ্যান্ডেল করো
-            if isinstance(data, dict):
-                # সাধারণ error চেক
-                if data.get("status") in ("error", "fail", False) or data.get("error"):
-                    msg = data.get("message") or data.get("error") or "API এরর।"
-                    return False, str(msg)
+            if not isinstance(data, dict):
+                return False, f"অপ্রত্যাশিত API রেসপন্স: {str(data)[:300]}"
 
-                # ডাউনলোড লিংক খোঁজো
-                download_url = (
-                    data.get("download_url")
-                    or data.get("downloadUrl")
-                    or data.get("url")
-                    or data.get("link")
-                    or data.get("direct_link")
-                )
+            # error চেক
+            if data.get("status") in ("error", "fail") or data.get("error"):
+                msg = data.get("message") or data.get("error") or "API এরর।"
+                return False, str(msg)
 
-                # list আকারে থাকলে
-                if not download_url and data.get("data"):
-                    inner = data["data"]
-                    if isinstance(inner, list) and len(inner) > 0:
-                        item = inner[0]
-                        download_url = (
-                            item.get("download_url")
-                            or item.get("url")
-                            or item.get("link")
-                            or item.get("dlink")
-                        )
-                    elif isinstance(inner, dict):
-                        download_url = (
-                            inner.get("download_url")
-                            or inner.get("url")
-                            or inner.get("link")
-                            or inner.get("dlink")
-                        )
+            # xapiverse.com এর আসল ফরম্যাট: {"status":"success","list":[{...}]}
+            file_list = data.get("list") or data.get("data") or []
+            if isinstance(file_list, list) and len(file_list) > 0:
+                results = []
+                for item in file_list:
+                    dl_url = (
+                        item.get("normal_dlink")
+                        or item.get("dlink")
+                        or item.get("download_url")
+                        or item.get("url")
+                        or item.get("link")
+                    )
+                    fname = (
+                        item.get("name")
+                        or item.get("file_name")
+                        or item.get("filename")
+                        or "terabox_video.mp4"
+                    )
+                    if dl_url:
+                        results.append({"download_url": dl_url, "file_name": fname})
 
-                if not download_url:
-                    return False, f"API রেসপন্সে ডাউনলোড লিংক পাওয়া যায়নি।\nRaw: {str(data)[:300]}"
+                if results:
+                    return True, results
 
-                file_name = (
-                    data.get("file_name")
-                    or data.get("filename")
-                    or data.get("name")
-                    or (data.get("data", [{}])[0].get("file_name") if isinstance(data.get("data"), list) else None)
-                    or "terabox_video.mp4"
-                )
+            # flat ফরম্যাট চেক (কিছু API সরাসরি দেয়)
+            dl_url = (
+                data.get("normal_dlink")
+                or data.get("dlink")
+                or data.get("download_url")
+                or data.get("url")
+                or data.get("link")
+            )
+            if dl_url:
+                fname = data.get("name") or data.get("file_name") or "terabox_video.mp4"
+                return True, [{"download_url": dl_url, "file_name": fname}]
 
-                return True, {
-                    "download_url": download_url,
-                    "file_name": file_name,
-                }
-
-            return False, f"অপ্রত্যাশিত API রেসপন্স: {str(data)[:300]}"
+            return False, f"API রেসপন্সে ডাউনলোড লিংক পাওয়া যায়নি।\nRaw: {str(data)[:300]}"
 
         except aiohttp.ClientError as e:
             return False, f"API কানেকশন সমস্যা: {str(e)}"
@@ -287,24 +280,34 @@ try:
                     await status_msg.edit_text(f"❌ Terabox লিংক প্রসেস করতে ব্যর্থ!\n{info}")
                     return
 
-                download_url = info["download_url"]
-                file_name = info["file_name"]
+                # info এখন একটি list (একাধিক ফাইল সাপোর্ট)
+                file_list = info
+                total = len(file_list)
 
-                await status_msg.edit_text(
-                    f"📄 ফাইল: {file_name}\n⬇️ ডাউনলোড শুরু হচ্ছে..."
-                )
+                for i, file_info in enumerate(file_list, 1):
+                    download_url = file_info["download_url"]
+                    file_name = file_info["file_name"]
+                    dl_path = f"terabox_{uid}_{i}.mp4"
 
-                success, result = await download_file(download_url, temp_dl, status_msg)
-                if not success:
-                    await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ!\n{result}")
-                    return
+                    await status_msg.edit_text(
+                        f"📄 ফাইল ({i}/{total}): {file_name}\n⬇️ ডাউনলোড শুরু হচ্ছে..."
+                    )
 
-                os.rename(temp_dl, mp4_path)
-                size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
-                await send_video_file(
-                    client, message, status_msg, mp4_path,
-                    f"☁️ Terabox ভিডিও: {file_name}\nআকার: {size_mb:.2f} MB"
-                )
+                    success, result = await download_file(download_url, dl_path, status_msg)
+                    if not success:
+                        await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ ({file_name})!\n{result}")
+                        continue
+
+                    try:
+                        size_mb = os.path.getsize(dl_path) / (1024 * 1024)
+                        await send_video_file(
+                            client, message, status_msg, dl_path,
+                            f"☁️ Terabox: {file_name}\nআকার: {size_mb:.2f} MB"
+                            + (f" ({i}/{total})" if total > 1 else "")
+                        )
+                    finally:
+                        if os.path.exists(dl_path):
+                            os.remove(dl_path)
                 return
 
             # ── সাধারণ লিংক ডাউনলোড ───────────────────────────────────
