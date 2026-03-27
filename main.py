@@ -293,6 +293,14 @@ try:
 
             if data.get("status") in ("error", "fail") or data.get("error"):
                 msg = data.get("message") or data.get("error") or "API এরর।"
+                if "subscribe" in str(msg).lower():
+                    msg = (
+                        "আপনার API Key এ Terabox API সাবস্ক্রাইব করা নেই।\n\n"
+                        "সমাধান:\n"
+                        "১. xapiverse.com এ লগিন করুন\n"
+                        "২. Terabox API খুঁজে Subscribe করুন\n"
+                        "৩. তারপর আবার চেষ্টা করুন"
+                    )
                 return False, str(msg)
 
             file_list = data.get("list") or data.get("data") or []
