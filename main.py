@@ -365,12 +365,12 @@ try:
                 reply_markup=main_menu_keyboard(user_id),
             )
 
-        # নতুন Key যোগের ধাপ ১: নাম চাও
+        # নতুন Key যোগ — সরাসরি key চাও
         elif data == "api_add":
-            waiting_state[user_id] = {"step": "label"}
+            waiting_state[user_id] = {"step": "key"}
             await callback.message.edit_text(
-                "✏️ **নতুন API Key এর নাম দিন**\n\n"
-                "উদাহরণ: `mykey1`, `personal`, `work`\n"
+                "✏️ **xapiverse.com এর API Key পাঠান**\n\n"
+                "উদাহরণ: `sk_43dcbaa7528c97b30b7d9b43f6b26f07`\n\n"
                 "বাতিল করতে /cancel লিখুন।",
                 reply_markup=None,
             )
@@ -464,33 +464,25 @@ try:
         user_id = message.from_user.id
         text = message.text.strip()
 
-        # ── API Key যোগের মাল্টি-স্টেপ ইনপুট ───────────────────────────
+        # ── API Key ইনপুট ────────────────────────────────────────────────
         if user_id in waiting_state:
             state = waiting_state[user_id]
 
-            if state["step"] == "label":
-                label = text.strip()
-                if len(label) < 1 or len(label) > 30:
-                    await message.reply_text("❌ নামটি ১–৩০ অক্ষরের মধ্যে হতে হবে। আবার লিখুন।")
-                    return
-                waiting_state[user_id] = {"step": "key", "label": label}
-                await message.reply_text(
-                    f"✅ নাম: **{label}**\n\n"
-                    "এখন xapiverse.com এর API Key টি পাঠান:\n"
-                    "বাতিল করতে /cancel লিখুন।"
-                )
-                return
-
-            elif state["step"] == "key":
+            if state["step"] == "key":
                 api_key = text.strip()
-                label = state["label"]
                 waiting_state.pop(user_id, None)
 
                 if len(api_key) < 10:
                     await message.reply_text(
-                        "❌ API Key টি সঠিক মনে হচ্ছে না। আবার /api দিয়ে চেষ্টা করুন।"
+                        "❌ API Key টি সঠিক মনে হচ্ছে না (অনেক ছোট)।\n"
+                        "আবার /api দিয়ে চেষ্টা করুন।"
                     )
                     return
+
+                # অটো-লেবেল: API 1, API 2, ...
+                udata = get_user_data(user_id)
+                existing = udata.get("keys", {})
+                label = f"API {len(existing) + 1}"
 
                 add_user_key(user_id, label, api_key)
                 await message.reply_text(
