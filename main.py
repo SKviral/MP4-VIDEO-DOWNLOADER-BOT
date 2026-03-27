@@ -75,7 +75,14 @@ try:
 
     def get_user_data(user_id: int) -> dict:
         data = load_data()
-        return data.get(str(user_id), {"active": None, "keys": {}})
+        raw = data.get(str(user_id), {"active": None, "keys": {}})
+        # পুরনো ফরম্যাট: সরাসরি string ছিল → নতুন ফরম্যাটে মাইগ্রেট করো
+        if isinstance(raw, str):
+            migrated = {"active": "default", "keys": {"default": raw}}
+            data[str(user_id)] = migrated
+            save_data(data)
+            return migrated
+        return raw
 
     def save_user_data(user_id: int, udata: dict):
         data = load_data()
