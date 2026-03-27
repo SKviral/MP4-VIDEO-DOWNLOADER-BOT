@@ -9,6 +9,7 @@ channel = "stable-25_05"
 
 [userenv.shared]
 PORT = "5000"
+TERABOX_API_KEY = "sk_43dcbaa7528c97b30b7d9b43f6b26f07"
 
 [workflows]
 runButton = "Project"

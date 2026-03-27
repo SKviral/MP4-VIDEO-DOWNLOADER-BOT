@@ -16,6 +16,7 @@ try:
     API_ID_STR = os.environ.get("API_ID", "").strip()
     API_HASH = os.environ.get("API_HASH", "").strip()
     BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+    TERABOX_API_KEY = os.environ.get("TERABOX_API_KEY", "").strip()
 
     if not API_ID_STR or not API_HASH or not BOT_TOKEN:
         print("❌ ERROR: API_ID, API_HASH বা BOT_TOKEN সেট করা নেই!", flush=True)
@@ -29,24 +30,117 @@ try:
 
     app = Client("video_downloader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-    CHUNK_SIZE = 2 * 1024 * 1024       # 2MB chunks
-    MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB max
+    CHUNK_SIZE = 2 * 1024 * 1024
+    MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
     MAX_RETRIES = 3
     VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v")
 
+    TERABOX_DOMAINS = (
+        "terabox.com",
+        "1024terabox.com",
+        "teraboxapp.com",
+        "freeterabox.com",
+        "4funbox.co",
+        "mirrobox.com",
+        "momerybox.com",
+        "tibibox.com",
+        "nephobox.com",
+        "terabox.app",
+    )
 
-    def is_zip_url(url, content_type):
-        url_lower = url.lower().split("?")[0]
-        return (
-            url_lower.endswith(".zip")
-            or "application/zip" in content_type
-            or "application/x-zip" in content_type
-            or "application/octet-stream" in content_type and url_lower.endswith(".zip")
-        )
+
+    def is_terabox_url(url):
+        url_lower = url.lower()
+        return any(domain in url_lower for domain in TERABOX_DOMAINS)
+
+
+    async def get_terabox_info(url):
+        """
+        Terabox API কল করে ফাইলের তথ্য ও ডাউনলোড লিংক নিয়ে আসে।
+        Returns (True, info_dict) অথবা (False, error_message)
+        """
+        if not TERABOX_API_KEY:
+            return False, "Terabox API Key সেট করা নেই।"
+
+        api_url = "https://xapiverse.com/api/terabox"
+        payload = {"url": url}
+        headers = {
+            "Content-Type": "application/json",
+            "xAPIverse-Key": TERABOX_API_KEY,
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(connect=15, total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(api_url, json=payload, headers=headers) as resp:
+                    data = await resp.json()
+
+            print(f"Terabox API response: {data}", flush=True)
+
+            # API সাফল্যজনক কিনা চেক
+            if not data:
+                return False, "API থেকে কোনো রেসপন্স আসেনি।"
+
+            # বিভিন্ন রেসপন্স ফরম্যাট হ্যান্ডেল করো
+            if isinstance(data, dict):
+                # সাধারণ error চেক
+                if data.get("status") in ("error", "fail", False) or data.get("error"):
+                    msg = data.get("message") or data.get("error") or "API এরর।"
+                    return False, str(msg)
+
+                # ডাউনলোড লিংক খোঁজো
+                download_url = (
+                    data.get("download_url")
+                    or data.get("downloadUrl")
+                    or data.get("url")
+                    or data.get("link")
+                    or data.get("direct_link")
+                )
+
+                # list আকারে থাকলে
+                if not download_url and data.get("data"):
+                    inner = data["data"]
+                    if isinstance(inner, list) and len(inner) > 0:
+                        item = inner[0]
+                        download_url = (
+                            item.get("download_url")
+                            or item.get("url")
+                            or item.get("link")
+                            or item.get("dlink")
+                        )
+                    elif isinstance(inner, dict):
+                        download_url = (
+                            inner.get("download_url")
+                            or inner.get("url")
+                            or inner.get("link")
+                            or inner.get("dlink")
+                        )
+
+                if not download_url:
+                    return False, f"API রেসপন্সে ডাউনলোড লিংক পাওয়া যায়নি।\nRaw: {str(data)[:300]}"
+
+                file_name = (
+                    data.get("file_name")
+                    or data.get("filename")
+                    or data.get("name")
+                    or (data.get("data", [{}])[0].get("file_name") if isinstance(data.get("data"), list) else None)
+                    or "terabox_video.mp4"
+                )
+
+                return True, {
+                    "download_url": download_url,
+                    "file_name": file_name,
+                }
+
+            return False, f"অপ্রত্যাশিত API রেসপন্স: {str(data)[:300]}"
+
+        except aiohttp.ClientError as e:
+            return False, f"API কানেকশন সমস্যা: {str(e)}"
+        except Exception as e:
+            return False, f"Terabox API এরর: {str(e)}"
 
 
     def find_videos_in_zip(extract_dir):
-        """ZIP এর ভেতর সব ভিডিও ফাইল খুঁজে বের করে, সাইজ অনুযায়ী সাজানো।"""
         videos = []
         for root, dirs, files in os.walk(extract_dir):
             for fname in files:
@@ -63,14 +157,14 @@ try:
         Returns (True, content_type) অথবা (False, error_message)
         """
         timeout = aiohttp.ClientTimeout(connect=30, sock_read=120, total=None)
-        headers = {
+        req_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
 
         err = "অজানা সমস্যা।"
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with aiohttp.ClientSession(timeout=timeout, headers=req_headers) as session:
                     async with session.get(url) as response:
                         if response.status != 200:
                             return False, f"সার্ভার {response.status} রেসপন্স দিয়েছে।"
@@ -135,13 +229,35 @@ try:
         return False, f"{MAX_RETRIES} বার চেষ্টার পরও ব্যর্থ: {err}"
 
 
+    async def send_video_file(client, message, status_msg, file_path, caption):
+        """ফাইল পাঠিয়ে status মেসেজ মুছে ফেলে।"""
+        size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        try:
+            await status_msg.edit_text(
+                f"✅ ডাউনলোড সম্পন্ন ({size_mb:.2f} MB)।\n⬆️ টেলিগ্রামে আপলোড হচ্ছে... 🚀"
+            )
+        except Exception:
+            pass
+
+        await client.send_video(
+            chat_id=message.chat.id,
+            video=file_path,
+            caption=caption,
+            reply_to_message_id=message.id,
+            supports_streaming=True,
+        )
+        await status_msg.delete()
+
+
     @app.on_message(filters.command("start"))
     async def start_cmd(client, message: Message):
         await message.reply_text(
             "হ্যালো! 👋\n"
-            "আমাকে যেকোনো ডাইরেক্ট MP4 বা ZIP (MP4 সহ) ডাউনলোড লিংক দিন।\n"
-            "আমি ডাউনলোড করে ভিডিও হিসেবে পাঠিয়ে দেবো। 🎬\n\n"
-            "⚠️ লিংকটি অবশ্যই ডাইরেক্ট ডাউনলোড লিংক হতে হবে।"
+            "নিচের যেকোনো ধরনের লিংক দিন:\n\n"
+            "🎬 ডাইরেক্ট MP4/ভিডিও লিংক\n"
+            "📦 ZIP ফাইল লিংক (ভেতরে MP4 থাকলে)\n"
+            "☁️ Terabox লিংক\n\n"
+            "আমি ডাউনলোড করে ভিডিও হিসেবে পাঠিয়ে দেবো। 🚀"
         )
 
 
@@ -162,6 +278,36 @@ try:
         temp_dl = f"dl_{uid}.tmp"
 
         try:
+            # ── Terabox লিংক হ্যান্ডেলিং ──────────────────────────────
+            if is_terabox_url(url):
+                await status_msg.edit_text("☁️ Terabox লিংক শনাক্ত হয়েছে!\n🔍 তথ্য সংগ্রহ করা হচ্ছে...")
+
+                ok, info = await get_terabox_info(url)
+                if not ok:
+                    await status_msg.edit_text(f"❌ Terabox লিংক প্রসেস করতে ব্যর্থ!\n{info}")
+                    return
+
+                download_url = info["download_url"]
+                file_name = info["file_name"]
+
+                await status_msg.edit_text(
+                    f"📄 ফাইল: {file_name}\n⬇️ ডাউনলোড শুরু হচ্ছে..."
+                )
+
+                success, result = await download_file(download_url, temp_dl, status_msg)
+                if not success:
+                    await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ!\n{result}")
+                    return
+
+                os.rename(temp_dl, mp4_path)
+                size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
+                await send_video_file(
+                    client, message, status_msg, mp4_path,
+                    f"☁️ Terabox ভিডিও: {file_name}\nআকার: {size_mb:.2f} MB"
+                )
+                return
+
+            # ── সাধারণ লিংক ডাউনলোড ───────────────────────────────────
             await status_msg.edit_text("⬇️ ডাউনলোড শুরু হচ্ছে...")
             success, result = await download_file(url, temp_dl, status_msg)
 
@@ -171,7 +317,7 @@ try:
 
             content_type = result
 
-            # ZIP কিনা সেটা নির্ধারণ করো
+            # ZIP কিনা নির্ধারণ করো
             url_lower = url.lower().split("?")[0]
             is_zip = (
                 url_lower.endswith(".zip")
@@ -179,7 +325,6 @@ try:
                 or "application/x-zip" in content_type
             )
 
-            # magic bytes দিয়েও চেক করো (PK signature)
             if not is_zip:
                 with open(temp_dl, "rb") as f:
                     magic = f.read(4)
@@ -187,22 +332,19 @@ try:
                     is_zip = True
 
             if is_zip:
-                # ZIP হ্যান্ডেল করো
                 os.rename(temp_dl, zip_path)
                 await status_msg.edit_text("📦 ZIP ফাইল পাওয়া গেছে। আনজিপ করা হচ্ছে...")
 
                 try:
                     with zipfile.ZipFile(zip_path, "r") as zf:
-                        # ZIP এর ভেতর ভিডিও আছে কিনা চেক
                         names = zf.namelist()
                         video_names = [n for n in names if n.lower().endswith(VIDEO_EXTENSIONS)]
                         if not video_names:
                             await status_msg.edit_text(
-                                "❌ ZIP ফাইলের ভেতরে কোনো ভিডিও পাওয়া যায়নি।\n"
+                                "❌ ZIP এর ভেতরে কোনো ভিডিও নেই।\n"
                                 f"ফাইলগুলো: {', '.join(names[:10])}"
                             )
                             return
-
                         os.makedirs(temp_dir, exist_ok=True)
                         zf.extractall(temp_dir)
                 except zipfile.BadZipFile:
@@ -239,22 +381,12 @@ try:
                 await status_msg.delete()
 
             else:
-                # সরাসরি MP4 বা অন্য ভিডিও
                 os.rename(temp_dl, mp4_path)
                 size_mb = os.path.getsize(mp4_path) / (1024 * 1024)
-                await status_msg.edit_text(
-                    f"✅ ডাউনলোড সম্পন্ন ({size_mb:.2f} MB)।\n⬆️ আপলোড হচ্ছে... 🚀"
+                await send_video_file(
+                    client, message, status_msg, mp4_path,
+                    f"✅ ভিডিও ডাউনলোড সম্পন্ন!\nআকার: {size_mb:.2f} MB"
                 )
-
-                await client.send_video(
-                    chat_id=message.chat.id,
-                    video=mp4_path,
-                    caption=f"✅ ভিডিও ডাউনলোড সম্পন্ন!\nআকার: {size_mb:.2f} MB",
-                    reply_to_message_id=message.id,
-                    supports_streaming=True,
-                )
-
-                await status_msg.delete()
 
         except Exception as e:
             print(f"Error: {e}", flush=True)
@@ -264,9 +396,8 @@ try:
             except Exception:
                 pass
         finally:
-            # সব টেম্প ফাইল মুছে ফেলো
             for path in [temp_dl, zip_path, mp4_path]:
-                if path and os.path.exists(path):
+                if os.path.exists(path):
                     os.remove(path)
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
