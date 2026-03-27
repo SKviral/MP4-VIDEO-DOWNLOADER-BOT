@@ -34,12 +34,12 @@ try:
     app = Client("video_downloader", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
     # ── Constants ─────────────────────────────────────────────────────────
-    CHUNK_SIZE     = 2 * 1024 * 1024
-    MAX_FILE_SIZE  = 2 * 1024 * 1024 * 1024
-    MAX_RETRIES    = 3
+    CHUNK_SIZE       = 2 * 1024 * 1024
+    MAX_FILE_SIZE    = 2 * 1024 * 1024 * 1024
+    MAX_RETRIES      = 3
     VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v")
-    USER_API_FILE  = "user_apis.json"
-    TERABOX_API_URL = "https://xapiverse.com/api/terabox"
+    USER_API_FILE    = "user_apis.json"
+    TERABOX_API_URL  = "https://xapiverse.com/api/terabox"
 
     TERABOX_DOMAINS = (
         "terabox.com", "1024terabox.com", "teraboxapp.com",
@@ -47,11 +47,20 @@ try:
         "momerybox.com", "tibibox.com", "nephobox.com", "terabox.app",
     )
 
-    # ── User API Storage ──────────────────────────────────────────────────
-    # যেসব user এখন API key টাইপ করার অপেক্ষায় আছে
-    waiting_for_api: set = set()
+    # ── State tracking ────────────────────────────────────────────────────
+    # { user_id: {"step": "label"|"key", "label": "নামটি"} }
+    waiting_state: dict = {}
 
-    def load_user_apis() -> dict:
+    # ── Storage helpers ───────────────────────────────────────────────────
+    # ফরম্যাট:
+    # {
+    #   "user_id": {
+    #     "active": "label1",
+    #     "keys": { "label1": "sk_xxx", "label2": "sk_yyy" }
+    #   }
+    # }
+
+    def load_data() -> dict:
         if os.path.exists(USER_API_FILE):
             try:
                 with open(USER_API_FILE, "r") as f:
@@ -60,23 +69,49 @@ try:
                 pass
         return {}
 
-    def save_user_apis(data: dict):
+    def save_data(data: dict):
         with open(USER_API_FILE, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, ensure_ascii=False, indent=2)
 
-    def get_user_api(user_id: int) -> str | None:
-        apis = load_user_apis()
-        return apis.get(str(user_id))
+    def get_user_data(user_id: int) -> dict:
+        data = load_data()
+        return data.get(str(user_id), {"active": None, "keys": {}})
 
-    def set_user_api(user_id: int, api_key: str):
-        apis = load_user_apis()
-        apis[str(user_id)] = api_key
-        save_user_apis(apis)
+    def save_user_data(user_id: int, udata: dict):
+        data = load_data()
+        data[str(user_id)] = udata
+        save_data(data)
 
-    def delete_user_api(user_id: int):
-        apis = load_user_apis()
-        apis.pop(str(user_id), None)
-        save_user_apis(apis)
+    def get_active_key(user_id: int) -> str | None:
+        udata = get_user_data(user_id)
+        active = udata.get("active")
+        if active and active in udata.get("keys", {}):
+            return udata["keys"][active]
+        return None
+
+    def add_user_key(user_id: int, label: str, api_key: str):
+        udata = get_user_data(user_id)
+        if "keys" not in udata:
+            udata["keys"] = {}
+        udata["keys"][label] = api_key
+        if not udata.get("active"):
+            udata["active"] = label
+        save_user_data(user_id, udata)
+
+    def set_active_key(user_id: int, label: str):
+        udata = get_user_data(user_id)
+        if label in udata.get("keys", {}):
+            udata["active"] = label
+            save_user_data(user_id, udata)
+
+    def delete_user_key(user_id: int, label: str):
+        udata = get_user_data(user_id)
+        keys = udata.get("keys", {})
+        keys.pop(label, None)
+        udata["keys"] = keys
+        if udata.get("active") == label:
+            udata["active"] = next(iter(keys), None)
+        save_user_data(user_id, udata)
 
     def mask_key(key: str) -> str:
         if len(key) <= 8:
@@ -84,30 +119,51 @@ try:
         return key[:4] + "****" + key[-4:]
 
     # ── Keyboards ─────────────────────────────────────────────────────────
-    def api_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-        has_key = bool(get_user_api(user_id))
+    def main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+        udata = get_user_data(user_id)
+        keys = udata.get("keys", {})
+        buttons = [
+            [InlineKeyboardButton("➕ নতুন API Key যোগ করুন", callback_data="api_add")],
+        ]
+        if keys:
+            buttons.append([InlineKeyboardButton("🔄 Active Key পরিবর্তন করুন", callback_data="api_switch")])
+            buttons.append([InlineKeyboardButton("🗑️ কোনো Key মুছুন", callback_data="api_delete_list")])
+        buttons.append([InlineKeyboardButton("📋 সব Key দেখুন", callback_data="api_list")])
+        buttons.append([InlineKeyboardButton("❓ API Key কোথায় পাবো?", callback_data="api_help")])
+        return InlineKeyboardMarkup(buttons)
+
+    def keys_select_keyboard(user_id: int, action: str) -> InlineKeyboardMarkup:
+        udata = get_user_data(user_id)
+        keys = udata.get("keys", {})
+        active = udata.get("active")
         buttons = []
-        if has_key:
-            buttons.append([
-                InlineKeyboardButton("🔑 API Key দেখুন", callback_data="api_view"),
-                InlineKeyboardButton("✏️ পরিবর্তন করুন", callback_data="api_add"),
-            ])
-            buttons.append([
-                InlineKeyboardButton("🗑️ API Key মুছুন", callback_data="api_delete"),
-            ])
-        else:
-            buttons.append([
-                InlineKeyboardButton("➕ নিজের API Key যোগ করুন", callback_data="api_add"),
-            ])
-        buttons.append([
-            InlineKeyboardButton("❓ API Key কোথায় পাবো?", callback_data="api_help"),
-        ])
+        for label in keys:
+            mark = "✅ " if label == active else ""
+            buttons.append([InlineKeyboardButton(
+                f"{mark}{label}", callback_data=f"{action}:{label}"
+            )])
+        buttons.append([InlineKeyboardButton("🔙 পিছনে যান", callback_data="api_menu")])
         return InlineKeyboardMarkup(buttons)
 
     def back_keyboard() -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 পিছনে যান", callback_data="api_menu")]
         ])
+
+    def menu_text(user_id: int) -> str:
+        udata = get_user_data(user_id)
+        keys = udata.get("keys", {})
+        active = udata.get("active")
+        if not keys:
+            status = "❌ কোনো API Key সেট নেই।\nএখন **ডিফল্ট API** ব্যবহার হচ্ছে।"
+        else:
+            active_key = keys.get(active, "")
+            status = (
+                f"✅ **{len(keys)}টি** API Key সেভ আছে।\n"
+                f"🟢 Active: **{active}** (`{mask_key(active_key)}`)\n"
+                "এই Key দিয়ে Terabox ডাউনলোড হচ্ছে।"
+            )
+        return f"⚙️ **Terabox API Key ম্যানেজমেন্ট**\n\n{status}"
 
     # ── Terabox ───────────────────────────────────────────────────────────
     def is_terabox_url(url: str) -> bool:
@@ -119,10 +175,7 @@ try:
             return False, "Terabox API Key সেট করা নেই।"
 
         payload = {"url": url}
-        headers = {
-            "Content-Type": "application/json",
-            "xAPIverse-Key": api_key,
-        }
+        headers = {"Content-Type": "application/json", "xAPIverse-Key": api_key}
 
         try:
             timeout = aiohttp.ClientTimeout(connect=15, total=30)
@@ -188,7 +241,6 @@ try:
         req_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
         }
-
         err = "অজানা সমস্যা।"
         for attempt in range(1, MAX_RETRIES + 1):
             try:
@@ -196,23 +248,18 @@ try:
                     async with session.get(url) as response:
                         if response.status != 200:
                             return False, f"সার্ভার {response.status} রেসপন্স দিয়েছে।"
-
                         content_type = response.headers.get("Content-Type", "")
                         if "text/html" in content_type:
                             return False, "এটি ডাইরেক্ট ডাউনলোড লিংক নয়, HTML পেজ।"
-
                         total_size = int(response.headers.get("Content-Length", 0))
                         if total_size > MAX_FILE_SIZE:
                             return False, f"ফাইলটি অনেক বড় ({total_size/(1024**3):.2f} GB)। সর্বোচ্চ ২ GB।"
-
                         downloaded = 0
                         last_update = time.time()
-
                         with open(save_path, "wb") as f:
                             async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                                 f.write(chunk)
                                 downloaded += len(chunk)
-
                                 now = time.time()
                                 if now - last_update >= 5:
                                     last_update = now
@@ -227,22 +274,18 @@ try:
                                         await status_msg.edit_text(txt)
                                     except Exception:
                                         pass
-
                         actual_size = os.path.getsize(save_path)
                         if actual_size == 0:
                             return False, "ডাউনলোড করা ফাইলটি খালি।"
                         if total_size > 0 and actual_size < total_size * 0.99:
                             return False, f"ফাইল অসম্পূর্ণ ({actual_size}/{total_size} bytes)।"
-
                         return True, content_type
-
             except aiohttp.ClientConnectorError:
                 err = "সার্ভারের সাথে কানেক্ট করা যাচ্ছে না।"
             except asyncio.TimeoutError:
                 err = "কানেকশন টাইমআউট হয়েছে।"
             except Exception as e:
                 err = str(e)
-
             if attempt < MAX_RETRIES:
                 try:
                     await status_msg.edit_text(
@@ -253,7 +296,6 @@ try:
                 await asyncio.sleep(3)
                 if os.path.exists(save_path):
                     os.remove(save_path)
-
         return False, f"{MAX_RETRIES} বার চেষ্টার পরও ব্যর্থ: {err}"
 
     async def send_video_file(client, message, status_msg, file_path: str, caption: str):
@@ -283,80 +325,127 @@ try:
             "📦 ZIP ফাইল লিংক (ভেতরে MP4 থাকলে)\n"
             "☁️ Terabox লিংক\n\n"
             "⚙️ নিজের Terabox API Key ম্যানেজ করতে /api কমান্ড দিন।\n\n"
-            "আমি ডাউনলোড করে ভিডিও হিসেবে পাঠিয়ে দেবো। 🚀",
+            "আমি ডাউনলোড করে ভিডিও হিসেবে পাঠিয়ে দেবো। 🚀"
         )
 
     @app.on_message(filters.command("api"))
     async def api_cmd(client, message: Message):
         user_id = message.from_user.id
-        has_key = bool(get_user_api(user_id))
-        text = (
-            "⚙️ **Terabox API Key ম্যানেজমেন্ট**\n\n"
-            + (
-                f"✅ আপনার নিজের API Key সেট আছে।\nআপনার Terabox ডাউনলোডে **আপনার API** ব্যবহার হচ্ছে।"
-                if has_key else
-                "❌ আপনার কোনো নিজস্ব API Key নেই।\nএখন **ডিফল্ট API** দিয়ে Terabox ডাউনলোড হচ্ছে।"
-            )
+        await message.reply_text(
+            menu_text(user_id),
+            reply_markup=main_menu_keyboard(user_id),
         )
-        await message.reply_text(text, reply_markup=api_menu_keyboard(user_id))
 
-    # ── Callback Query Handler ────────────────────────────────────────────
+    @app.on_message(filters.command("cancel"))
+    async def cancel_cmd(client, message: Message):
+        user_id = message.from_user.id
+        if user_id in waiting_state:
+            waiting_state.pop(user_id, None)
+            await message.reply_text("❌ বাতিল করা হয়েছে।")
+        else:
+            await message.reply_text("কোনো সক্রিয় অপেক্ষা নেই।")
+
+    # ── Callback Queries ──────────────────────────────────────────────────
     @app.on_callback_query()
     async def callback_handler(client, callback: CallbackQuery):
         user_id = callback.from_user.id
         data = callback.data
 
+        # মেইন মেনু
         if data == "api_menu":
-            has_key = bool(get_user_api(user_id))
-            text = (
-                "⚙️ **Terabox API Key ম্যানেজমেন্ট**\n\n"
-                + (
-                    "✅ আপনার নিজের API Key সেট আছে।\nআপনার Terabox ডাউনলোডে **আপনার API** ব্যবহার হচ্ছে।"
-                    if has_key else
-                    "❌ আপনার কোনো নিজস্ব API Key নেই।\nএখন **ডিফল্ট API** দিয়ে Terabox ডাউনলোড হচ্ছে।"
-                )
-            )
-            await callback.message.edit_text(text, reply_markup=api_menu_keyboard(user_id))
-
-        elif data == "api_view":
-            key = get_user_api(user_id)
-            if key:
-                await callback.message.edit_text(
-                    f"🔑 **আপনার API Key:**\n`{mask_key(key)}`\n\n"
-                    "🔒 নিরাপত্তার জন্য আংশিক দেখানো হচ্ছে।",
-                    reply_markup=back_keyboard(),
-                )
-            else:
-                await callback.message.edit_text(
-                    "❌ কোনো API Key সেট নেই।",
-                    reply_markup=back_keyboard(),
-                )
-
-        elif data == "api_add":
-            waiting_for_api.add(user_id)
             await callback.message.edit_text(
-                "✏️ **নতুন API Key লিখুন**\n\n"
-                "xapiverse.com থেকে পাওয়া API Key টি পাঠান।\n"
+                menu_text(user_id),
+                reply_markup=main_menu_keyboard(user_id),
+            )
+
+        # নতুন Key যোগের ধাপ ১: নাম চাও
+        elif data == "api_add":
+            waiting_state[user_id] = {"step": "label"}
+            await callback.message.edit_text(
+                "✏️ **নতুন API Key এর নাম দিন**\n\n"
+                "উদাহরণ: `mykey1`, `personal`, `work`\n"
                 "বাতিল করতে /cancel লিখুন।",
                 reply_markup=None,
             )
 
-        elif data == "api_delete":
-            delete_user_api(user_id)
+        # সব Key তালিকা
+        elif data == "api_list":
+            udata = get_user_data(user_id)
+            keys = udata.get("keys", {})
+            active = udata.get("active")
+            if not keys:
+                text = "📋 কোনো API Key সেভ নেই।"
+            else:
+                lines = ["📋 **আপনার সব API Key:**\n"]
+                for label, key_val in keys.items():
+                    mark = "🟢 " if label == active else "⚪️ "
+                    lines.append(f"{mark}**{label}**: `{mask_key(key_val)}`")
+                text = "\n".join(lines)
+            await callback.message.edit_text(text, reply_markup=back_keyboard())
+
+        # Active Key পরিবর্তন — Key সিলেক্ট করো
+        elif data == "api_switch":
+            udata = get_user_data(user_id)
+            keys = udata.get("keys", {})
+            if not keys:
+                await callback.message.edit_text(
+                    "❌ কোনো Key নেই। আগে যোগ করুন।",
+                    reply_markup=back_keyboard(),
+                )
+            else:
+                await callback.message.edit_text(
+                    "🔄 **কোন Key Active করবেন?**\n"
+                    "✅ চিহ্নিতটি এখন Active।",
+                    reply_markup=keys_select_keyboard(user_id, "switch"),
+                )
+
+        # Active Key সেট করো
+        elif data.startswith("switch:"):
+            label = data.split(":", 1)[1]
+            set_active_key(user_id, label)
             await callback.message.edit_text(
-                "🗑️ আপনার API Key মুছে ফেলা হয়েছে।\n"
-                "এখন থেকে ডিফল্ট API ব্যবহার হবে।",
-                reply_markup=api_menu_keyboard(user_id),
+                f"✅ **{label}** এখন Active Key হিসেবে সেট হয়েছে।",
+                reply_markup=back_keyboard(),
             )
 
+        # মুছার তালিকা
+        elif data == "api_delete_list":
+            udata = get_user_data(user_id)
+            keys = udata.get("keys", {})
+            if not keys:
+                await callback.message.edit_text(
+                    "❌ কোনো Key নেই।",
+                    reply_markup=back_keyboard(),
+                )
+            else:
+                await callback.message.edit_text(
+                    "🗑️ **কোন Key মুছতে চান?**\nক্লিক করলেই মুছে যাবে।",
+                    reply_markup=keys_select_keyboard(user_id, "del"),
+                )
+
+        # নির্দিষ্ট Key মুছো
+        elif data.startswith("del:"):
+            label = data.split(":", 1)[1]
+            delete_user_key(user_id, label)
+            udata = get_user_data(user_id)
+            keys = udata.get("keys", {})
+            await callback.message.edit_text(
+                f"🗑️ **{label}** মুছে ফেলা হয়েছে।",
+                reply_markup=(
+                    keys_select_keyboard(user_id, "del")
+                    if keys else back_keyboard()
+                ),
+            )
+
+        # সাহায্য
         elif data == "api_help":
             await callback.message.edit_text(
                 "❓ **Terabox API Key কোথায় পাবেন?**\n\n"
                 "১. [xapiverse.com](https://xapiverse.com) এ যান\n"
                 "২. রেজিস্ট্রেশন করুন\n"
                 "৩. Dashboard থেকে API Key কপি করুন\n"
-                "৪. বটে ফিরে এসে **➕ নিজের API Key যোগ করুন** বাটনে ক্লিক করুন\n\n"
-                "নিজের API Key ব্যবহার করলে আপনার নিজস্ব limit ও speed পাবেন।",
+                "৪. বটে /api দিয়ে **➕ নতুন API Key যোগ করুন** চাপুন\n\n"
+                "নিজের Key ব্যবহার করলে আলাদা limit ও speed পাবেন।",
                 reply_markup=back_keyboard(),
             )
 
@@ -368,25 +457,43 @@ try:
         user_id = message.from_user.id
         text = message.text.strip()
 
-        # ── API Key ইনপুট মোড ────────────────────────────────────────────
-        if user_id in waiting_for_api:
-            waiting_for_api.discard(user_id)
-            api_key = text.strip()
+        # ── API Key যোগের মাল্টি-স্টেপ ইনপুট ───────────────────────────
+        if user_id in waiting_state:
+            state = waiting_state[user_id]
 
-            if len(api_key) < 10:
+            if state["step"] == "label":
+                label = text.strip()
+                if len(label) < 1 or len(label) > 30:
+                    await message.reply_text("❌ নামটি ১–৩০ অক্ষরের মধ্যে হতে হবে। আবার লিখুন।")
+                    return
+                waiting_state[user_id] = {"step": "key", "label": label}
                 await message.reply_text(
-                    "❌ API Key টি সঠিক মনে হচ্ছে না। আবার /api দিয়ে চেষ্টা করুন।"
+                    f"✅ নাম: **{label}**\n\n"
+                    "এখন xapiverse.com এর API Key টি পাঠান:\n"
+                    "বাতিল করতে /cancel লিখুন।"
                 )
                 return
 
-            set_user_api(user_id, api_key)
-            await message.reply_text(
-                f"✅ **API Key সফলভাবে সেভ হয়েছে!**\n"
-                f"🔑 Key: `{mask_key(api_key)}`\n\n"
-                "এখন থেকে Terabox ডাউনলোডে আপনার নিজের API Key ব্যবহার হবে।",
-                reply_markup=api_menu_keyboard(user_id),
-            )
-            return
+            elif state["step"] == "key":
+                api_key = text.strip()
+                label = state["label"]
+                waiting_state.pop(user_id, None)
+
+                if len(api_key) < 10:
+                    await message.reply_text(
+                        "❌ API Key টি সঠিক মনে হচ্ছে না। আবার /api দিয়ে চেষ্টা করুন।"
+                    )
+                    return
+
+                add_user_key(user_id, label, api_key)
+                await message.reply_text(
+                    f"✅ **API Key সফলভাবে সেভ হয়েছে!**\n\n"
+                    f"🏷️ নাম: **{label}**\n"
+                    f"🔑 Key: `{mask_key(api_key)}`\n\n"
+                    "এখন এই Key টি Active আছে।",
+                    reply_markup=main_menu_keyboard(user_id),
+                )
+                return
 
         # ── URL হ্যান্ডেলিং ───────────────────────────────────────────────
         if not (text.startswith("http://") or text.startswith("https://")):
@@ -396,7 +503,7 @@ try:
         url = text
         status_msg = await message.reply_text("⏳ লিংকটি চেক করা হচ্ছে...")
 
-        uid = f"{user_id}_{int(time.time())}"
+        uid      = f"{user_id}_{int(time.time())}"
         temp_dir = f"temp_{uid}"
         zip_path = f"{temp_dir}.zip"
         mp4_path = f"video_{uid}.mp4"
@@ -405,9 +512,13 @@ try:
         try:
             # ── Terabox ───────────────────────────────────────────────────
             if is_terabox_url(url):
-                user_api = get_user_api(user_id)
-                active_key = user_api or DEFAULT_TERABOX_KEY
-                key_label = "🔑 আপনার API" if user_api else "🌐 ডিফল্ট API"
+                active_key = get_active_key(user_id) or DEFAULT_TERABOX_KEY
+                udata = get_user_data(user_id)
+                active_label = udata.get("active")
+                if get_active_key(user_id):
+                    key_label = f"🔑 {active_label}"
+                else:
+                    key_label = "🌐 ডিফল্ট API"
 
                 await status_msg.edit_text(
                     f"☁️ Terabox লিংক শনাক্ত হয়েছে!\n"
@@ -427,21 +538,19 @@ try:
                 total = len(file_list)
 
                 for i, file_info in enumerate(file_list, 1):
-                    download_url = file_info["download_url"]
-                    file_name    = file_info["file_name"]
-                    dl_path      = f"terabox_{uid}_{i}.mp4"
+                    dl_url    = file_info["download_url"]
+                    file_name = file_info["file_name"]
+                    dl_path   = f"terabox_{uid}_{i}.mp4"
 
                     await status_msg.edit_text(
                         f"📄 ফাইল ({i}/{total}): {file_name}\n⬇️ ডাউনলোড শুরু হচ্ছে..."
                     )
-
-                    success, result = await download_file(download_url, dl_path, status_msg)
+                    success, result = await download_file(dl_url, dl_path, status_msg)
                     if not success:
                         await status_msg.edit_text(
                             f"❌ ডাউনলোড ব্যর্থ ({file_name})!\n{result}"
                         )
                         continue
-
                     try:
                         size_mb = os.path.getsize(dl_path) / (1024 * 1024)
                         await send_video_file(
@@ -469,7 +578,6 @@ try:
                 or "application/zip" in content_type
                 or "application/x-zip" in content_type
             )
-
             if not is_zip:
                 with open(temp_dl, "rb") as f:
                     magic = f.read(4)
@@ -479,7 +587,6 @@ try:
             if is_zip:
                 os.rename(temp_dl, zip_path)
                 await status_msg.edit_text("📦 ZIP ফাইল পাওয়া গেছে। আনজিপ করা হচ্ছে...")
-
                 try:
                     with zipfile.ZipFile(zip_path, "r") as zf:
                         names = zf.namelist()
@@ -505,7 +612,6 @@ try:
                 await status_msg.edit_text(
                     f"✅ {total_videos}টি ভিডিও পাওয়া গেছে।\n⬆️ আপলোড শুরু হচ্ছে..."
                 )
-
                 for i, (video_path, video_fname) in enumerate(videos, 1):
                     size_mb = os.path.getsize(video_path) / (1024 * 1024)
                     try:
@@ -521,7 +627,6 @@ try:
                         reply_to_message_id=message.id,
                         supports_streaming=True,
                     )
-
                 await status_msg.delete()
 
             else:
@@ -545,15 +650,6 @@ try:
                     os.remove(path)
             if os.path.exists(temp_dir):
                 shutil.rmtree(temp_dir, ignore_errors=True)
-
-    @app.on_message(filters.command("cancel"))
-    async def cancel_cmd(client, message: Message):
-        user_id = message.from_user.id
-        if user_id in waiting_for_api:
-            waiting_for_api.discard(user_id)
-            await message.reply_text("❌ বাতিল করা হয়েছে।")
-        else:
-            await message.reply_text("কোনো সক্রিয় অপেক্ষা নেই।")
 
     # ── Run ───────────────────────────────────────────────────────────────
     if __name__ == "__main__":
