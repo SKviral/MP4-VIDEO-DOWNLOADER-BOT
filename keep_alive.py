@@ -1,15 +1,15 @@
+import os
 from flask import Flask
 from threading import Thread
-import os
 
-app = Flask('')
+app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot is running on Render!"
+    return "Bot is alive and running!"
 
 def run():
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))  # <--- Render এর জন্য ডায়নামিক পোর্ট
     app.run(host='0.0.0.0', port=port)
 
 def keep_alive():
