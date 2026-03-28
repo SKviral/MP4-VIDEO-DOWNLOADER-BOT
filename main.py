@@ -37,6 +37,7 @@ try:
     # ── Constants ─────────────────────────────────────────────────────────
     CHUNK_SIZE       = 2 * 1024 * 1024
     MAX_FILE_SIZE    = 2 * 1024 * 1024 * 1024
+    MIN_VIDEO_SIZE   = 10 * 1024   # ১০ KB — এর চেয়ে ছোট হলে ভিডিও নয়
     MAX_RETRIES      = 3
     VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v")
     USER_API_FILE    = "user_apis.json"
@@ -143,23 +144,24 @@ try:
         data = load_channels()
         return data.get(str(user_id), [])
 
-    def add_user_channel(user_id: int, channel_id: int, title: str) -> bool:
+    def add_user_channel(user_id: int, channel_id, title: str) -> bool:
         data = load_channels()
         uid = str(user_id)
         if uid not in data:
             data[uid] = []
+        # duplicate চেক — int ও string উভয় ফরম্যাটে তুলনা
         for ch in data[uid]:
-            if ch["id"] == channel_id:
+            if str(ch["id"]) == str(channel_id):
                 return False  # ইতিমধ্যেই আছে
         data[uid].append({"id": channel_id, "title": title})
         save_channels(data)
         return True
 
-    def delete_user_channel(user_id: int, channel_id: int):
+    def delete_user_channel(user_id: int, index: int):
         data = load_channels()
         uid = str(user_id)
-        if uid in data:
-            data[uid] = [ch for ch in data[uid] if ch["id"] != channel_id]
+        if uid in data and 0 <= index < len(data[uid]):
+            data[uid].pop(index)
             save_channels(data)
 
     # ════════════════════════════════════════════════════════════════════════
@@ -223,9 +225,9 @@ try:
     def channel_delete_keyboard(user_id: int) -> InlineKeyboardMarkup:
         channels = get_user_channels(user_id)
         buttons = []
-        for ch in channels:
+        for i, ch in enumerate(channels):
             buttons.append([InlineKeyboardButton(
-                f"🗑️ {ch['title']}", callback_data=f"ch_del:{ch['id']}"
+                f"🗑️ {ch['title']}", callback_data=f"ch_del:{i}"
             )])
         buttons.append([InlineKeyboardButton("🔙 পিছনে যান", callback_data="ch_menu")])
         return InlineKeyboardMarkup(buttons)
@@ -394,6 +396,13 @@ try:
                         actual_size = os.path.getsize(save_path)
                         if actual_size == 0:
                             return False, "ডাউনলোড করা ফাইলটি খালি।"
+                        # HTML error page চেক
+                        with open(save_path, "rb") as f:
+                            head = f.read(128).lower()
+                        if head.startswith(b"<!") or b"<html" in head or head.startswith(b"<html"):
+                            return False, "সার্ভার ভিডিওর বদলে HTML পেজ পাঠিয়েছে। লিংকটি সঠিক নয়।"
+                        if actual_size < MIN_VIDEO_SIZE:
+                            return False, f"ডাউনলোড হওয়া ফাইল অনেক ছোট ({actual_size} bytes)। সঠিক ভিডিও নয়।"
                         if total_size > 0 and actual_size < total_size * 0.99:
                             return False, f"ফাইল অসম্পূর্ণ ({actual_size}/{total_size} bytes)।"
                         return True, content_type
@@ -652,8 +661,8 @@ try:
                 )
 
         elif data.startswith("ch_del:"):
-            ch_id = int(data.split(":", 1)[1])
-            delete_user_channel(user_id, ch_id)
+            idx = int(data.split(":", 1)[1])
+            delete_user_channel(user_id, idx)
             channels = get_user_channels(user_id)
             await callback.message.edit_text(
                 "🗑️ চ্যানেল মুছে ফেলা হয়েছে।",
@@ -792,6 +801,8 @@ try:
 
     @app.on_message(filters.text & ~filters.regex(r"^/"))
     async def handle_text(client, message: Message):
+        if not message.from_user:
+            return
         user_id = message.from_user.id
         text = message.text.strip()
 
@@ -863,31 +874,32 @@ try:
                         )
                     return
 
-                # সরাসরি ID বা @username
+                # সরাসরি ID বা @username — get_chat() ছাড়াই সেভ করো
                 channel_input = text.strip()
                 waiting_state.pop(user_id, None)
 
+                # int ID নাকি @username?
                 try:
-                    chat = await client.get_chat(channel_input)
-                    added = add_user_channel(user_id, chat.id, chat.title or channel_input)
-                    if added:
-                        await message.reply_text(
-                            f"✅ **{chat.title}** চ্যানেল সেভ হয়েছে!\n"
-                            f"ID: `{chat.id}`\n\n"
-                            "⚠️ নিশ্চিত করুন বট চ্যানেলের Admin আছে।",
-                            reply_markup=channel_main_keyboard(user_id),
-                        )
-                    else:
-                        await message.reply_text(
-                            "⚠️ এই চ্যানেল আগেই সেভ আছে।",
-                            reply_markup=channel_main_keyboard(user_id),
-                        )
-                except Exception as e:
+                    channel_id = int(channel_input)
+                    title = f"Channel {channel_id}"
+                except ValueError:
+                    # @username হিসেবে রাখো
+                    channel_id = channel_input
+                    title = channel_input
+
+                added = add_user_channel(user_id, channel_id, title)
+                if added:
                     await message.reply_text(
-                        f"❌ চ্যানেল খুঁজে পাওয়া যায়নি।\n`{str(e)}`\n\n"
-                        "নিশ্চিত করুন:\n"
-                        "• বটকে চ্যানেলে Admin হিসেবে যোগ করা হয়েছে\n"
-                        "• ID বা @username সঠিক আছে"
+                        f"✅ চ্যানেল সেভ হয়েছে!\n"
+                        f"ID: `{channel_id}`\n\n"
+                        "⚠️ নিশ্চিত করুন বটকে চ্যানেলের Admin করা হয়েছে।\n"
+                        "💡 চ্যানেল থেকে পোস্ট ফরওয়ার্ড করলে নামও সেভ হবে।",
+                        reply_markup=channel_main_keyboard(user_id),
+                    )
+                else:
+                    await message.reply_text(
+                        "⚠️ এই চ্যানেল আগেই সেভ আছে।",
+                        reply_markup=channel_main_keyboard(user_id),
                     )
                 return
 
