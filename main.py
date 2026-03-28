@@ -313,12 +313,19 @@ try:
                         item.get("normal_dlink") or item.get("dlink")
                         or item.get("download_url") or item.get("url") or item.get("link")
                     )
+                    zip_url = item.get("zip_dlink") or item.get("zip_url")
                     fname = (
                         item.get("name") or item.get("file_name")
                         or item.get("filename") or "terabox_video.mp4"
                     )
+                    if not fname.lower().endswith(VIDEO_EXTENSIONS):
+                        fname = fname.rsplit(".", 1)[0] + ".mp4"
                     if dl_url:
-                        results.append({"download_url": dl_url, "file_name": fname})
+                        results.append({
+                            "download_url": dl_url,
+                            "zip_url": zip_url,
+                            "file_name": fname,
+                        })
                 if results:
                     return True, results
 
@@ -328,7 +335,10 @@ try:
             )
             if dl_url:
                 fname = data.get("name") or data.get("file_name") or "terabox_video.mp4"
-                return True, [{"download_url": dl_url, "file_name": fname}]
+                if not fname.lower().endswith(VIDEO_EXTENSIONS):
+                    fname = fname.rsplit(".", 1)[0] + ".mp4"
+                zip_url = data.get("zip_dlink") or data.get("zip_url")
+                return True, [{"download_url": dl_url, "zip_url": zip_url, "file_name": fname}]
 
             return False, f"API রেসপন্সে ডাউনলোড লিংক পাওয়া যায়নি।\nRaw: {str(data)[:300]}"
 
@@ -424,7 +434,39 @@ try:
                     os.remove(save_path)
         return False, f"{MAX_RETRIES} বার চেষ্টার পরও ব্যর্থ: {err}"
 
+    async def download_terabox_with_fallback(
+        primary_url: str, fallback_url: str | None, save_path: str, status_msg
+    ):
+        """primary URL দিয়ে চেষ্টা করো, ব্যর্থ হলে fallback (zip_dlink) দিয়ে চেষ্টা করো।"""
+        ok, result = await download_file(primary_url, save_path, status_msg)
+        if ok:
+            return True, result
+        # primary ব্যর্থ — fallback চেষ্টা
+        if fallback_url and fallback_url != primary_url:
+            print(f"Primary URL failed ({result}), trying fallback zip_dlink...", flush=True)
+            try:
+                await status_msg.edit_text("⚠️ মূল লিংক ব্যর্থ, বিকল্প লিংক দিয়ে চেষ্টা হচ্ছে...")
+            except Exception:
+                pass
+            if os.path.exists(save_path):
+                os.remove(save_path)
+            ok2, result2 = await download_file(fallback_url, save_path, status_msg)
+            if ok2:
+                return True, result2
+            return False, f"উভয় লিংক ব্যর্থ।\nমূল: {result}\nবিকল্প: {result2}"
+        return False, result
+
+    def ensure_mp4_path(path: str) -> str:
+        """ফাইলটি .mp4 হিসেবে নামকরণ নিশ্চিত করো।"""
+        if not path.lower().endswith(".mp4"):
+            new_path = path.rsplit(".", 1)[0] + ".mp4"
+            if os.path.exists(path):
+                os.rename(path, new_path)
+            return new_path
+        return path
+
     async def send_video_file(client, message, status_msg, file_path: str, caption: str):
+        file_path = ensure_mp4_path(file_path)
         size_mb = os.path.getsize(file_path) / (1024 * 1024)
         try:
             await status_msg.edit_text(
@@ -476,10 +518,11 @@ try:
 
                 # ২. ডাউনলোড করা Terabox ভিডিও পোস্ট করো
                 if downloaded_video_path and os.path.exists(downloaded_video_path):
-                    size_mb = os.path.getsize(downloaded_video_path) / (1024 * 1024)
+                    vid_path = ensure_mp4_path(downloaded_video_path)
+                    size_mb = os.path.getsize(vid_path) / (1024 * 1024)
                     await client.send_video(
                         chat_id=ch_id,
-                        video=downloaded_video_path,
+                        video=vid_path,
                         caption=f"🎬 {downloaded_video_name}\nআকার: {size_mb:.2f} MB",
                         supports_streaming=True,
                     )
@@ -679,6 +722,8 @@ try:
 
     @app.on_message(filters.forwarded & (filters.photo | filters.video))
     async def handle_forwarded_media(client, message: Message):
+        if not message.from_user:
+            return
         user_id = message.from_user.id
 
         # ── চ্যানেল যোগের মোডে আছে? ─────────────────────────────────────
@@ -752,6 +797,7 @@ try:
 
         for i, file_info in enumerate(info, 1):
             dl_url    = file_info["download_url"]
+            zip_url   = file_info.get("zip_url")
             file_name = file_info["file_name"]
             dl_path   = f"ch_{uid}_{i}.mp4"
 
@@ -759,7 +805,9 @@ try:
                 await status_msg.edit_text(
                     f"⬇️ ডাউনলোড হচ্ছে ({i}/{total_files}): {file_name}"
                 )
-                success, result = await download_file(dl_url, dl_path, status_msg)
+                success, result = await download_terabox_with_fallback(
+                    dl_url, zip_url, dl_path, status_msg
+                )
                 if not success:
                     await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ: {result}")
                     continue
@@ -938,20 +986,24 @@ try:
                     )
                     return
 
+                total = len(info)
                 for i, file_info in enumerate(info, 1):
                     dl_url    = file_info["download_url"]
+                    zip_url   = file_info.get("zip_url")
                     file_name = file_info["file_name"]
                     dl_path   = f"terabox_{uid}_{i}.mp4"
-                    total     = len(info)
 
                     await status_msg.edit_text(
                         f"📄 ফাইল ({i}/{total}): {file_name}\n⬇️ ডাউনলোড শুরু হচ্ছে..."
                     )
-                    success, result = await download_file(dl_url, dl_path, status_msg)
+                    success, result = await download_terabox_with_fallback(
+                        dl_url, zip_url, dl_path, status_msg
+                    )
                     if not success:
                         await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ ({file_name})!\n{result}")
                         continue
                     try:
+                        dl_path = ensure_mp4_path(dl_path)
                         size_mb = os.path.getsize(dl_path) / (1024 * 1024)
                         await send_video_file(
                             client, message, status_msg, dl_path,
@@ -1013,6 +1065,7 @@ try:
                     f"✅ {total_videos}টি ভিডিও পাওয়া গেছে।\n⬆️ আপলোড শুরু হচ্ছে..."
                 )
                 for i, (video_path, video_fname) in enumerate(videos, 1):
+                    video_path = ensure_mp4_path(video_path)
                     size_mb = os.path.getsize(video_path) / (1024 * 1024)
                     try:
                         await status_msg.edit_text(
