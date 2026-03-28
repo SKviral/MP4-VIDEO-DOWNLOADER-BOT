@@ -1105,7 +1105,7 @@ try:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
     # ── Run ───────────────────────────────────────────────────────────────
-    if __name__ == "__main__":
+if __name__ == "__main__":
     print("✅ Bot is successfully running...", flush=True)
 
     app.start()
