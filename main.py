@@ -1106,9 +1106,18 @@ try:
 
     # ── Run ───────────────────────────────────────────────────────────────
     if __name__ == "__main__":
-        keep_alive()
-        print("✅ Bot is successfully running...", flush=True)
-        app.run()
+    print("✅ Bot is successfully running...", flush=True)
+
+    app.start()
+    print("🤖 Bot started and listening for messages...", flush=True)
+
+    try:
+        from pyrogram import idle
+        idle()
+    except KeyboardInterrupt:
+        print("🛑 Bot stopped manually")
+
+    app.stop()
 
 except Exception as e:
     print("❌ CRITICAL ERROR:", flush=True)
