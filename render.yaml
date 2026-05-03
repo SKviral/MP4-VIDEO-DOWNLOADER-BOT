@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: terabox-bot
+    env: python
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: TERABOX_API_KEY
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+    healthCheckPath: /health
