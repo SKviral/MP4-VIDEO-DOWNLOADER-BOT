@@ -1407,10 +1407,35 @@ async def callback_handler(client, callback: CallbackQuery):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 পিছনে যান", callback_data="start_menu")]])
             )
 
+    elif data.startswith("restore:"):
+        msg_id = data.split(":")[1]
+        zip_tmp = os.path.join(BACKUP_TEMP_DIR, f"restore_{user_id}_{msg_id}.zip")
+
+        if not os.path.exists(zip_tmp):
+            await callback.message.edit_text("❌ ফাইলটি আর নেই। আবার পাঠান।")
+            await callback.answer()
+            return
+
+        success, msg = restore_from_backup(zip_tmp)
+        await callback.message.edit_text(msg)
+        if os.path.exists(zip_tmp):
+            os.remove(zip_tmp)
+
+    elif data == "restore_cancel":
+        # temp ফাইল মুছো
+        if os.path.exists(BACKUP_TEMP_DIR):
+            for f in os.listdir(BACKUP_TEMP_DIR):
+                if f.startswith(f"restore_{user_id}_"):
+                    try:
+                        os.remove(os.path.join(BACKUP_TEMP_DIR, f))
+                    except Exception:
+                        pass
+        await callback.message.edit_text("❌ রিস্টোর বাতিল করা হয়েছে।")
+
     await callback.answer()
 
 # ══════════════════════════════════════════════════════════════════════
-# DOCUMENT HANDLER — ZIP ব্যাকআপ রিস্টোর
+# DOCUMENT HANDLER — ZIP BACKUP RESTORE
 # ══════════════════════════════════════════════════════════════════════
 @app.on_message(filters.document)
 async def handle_document(client, message: Message):
@@ -1439,36 +1464,6 @@ async def handle_document(client, message: Message):
         "❌ শুধুমাত্র ZIP ফাইল সাপোর্ট করা হয় (ব্যাকআপ রিস্টোরের জন্য)।\n"
         "ভিডিও লিংক পাঠান ডাউনলোড করতে।"
     )
-
-@app.on_callback_query(filters.regex(r"^restore:"))
-async def restore_callback(client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    msg_id = callback.data.split(":")[1]
-    zip_tmp = os.path.join(BACKUP_TEMP_DIR, f"restore_{user_id}_{msg_id}.zip")
-
-    if not os.path.exists(zip_tmp):
-        await callback.message.edit_text("❌ ফাইলটি আর নেই। আবার পাঠান।")
-        return
-
-    success, msg = restore_from_backup(zip_tmp)
-    await callback.message.edit_text(msg)
-    if os.path.exists(zip_tmp):
-        os.remove(zip_tmp)
-    await callback.answer()
-
-@app.on_callback_query(filters.regex(r"^restore_cancel$"))
-async def restore_cancel(client, callback: CallbackQuery):
-    user_id = callback.from_user.id
-    # temp ফাইল মুছো
-    if os.path.exists(BACKUP_TEMP_DIR):
-        for f in os.listdir(BACKUP_TEMP_DIR):
-            if f.startswith(f"restore_{user_id}_"):
-                try:
-                    os.remove(os.path.join(BACKUP_TEMP_DIR, f))
-                except Exception:
-                    pass
-    await callback.message.edit_text("❌ রিস্টোর বাতিল করা হয়েছে।")
-    await callback.answer()
 
 # ══════════════════════════════════════════════════════════════════════
 # FORWARDED MEDIA HANDLER
