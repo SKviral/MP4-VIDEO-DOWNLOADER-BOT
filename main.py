@@ -920,7 +920,10 @@ async def post_to_channels(
     fail_msgs = []
 
     for ch in channels:
-        ch_id = ch["id"]
+        try:
+            ch_id = int(ch["id"])
+        except ValueError:
+            ch_id = ch["id"]
         ch_title = ch["title"]
         try:
             # ─── ১. প্রথমে ডাউনলোড করা ভিডিও পাঠাও ───────────────────────
@@ -1563,6 +1566,7 @@ async def actual_handle_forwarded_media(client, message: Message, status_msg=Non
 
     total_files = len(info)
     posted_channels = 0
+    all_failures = []
 
     for i, file_info in enumerate(info, 1):
         dl_url    = file_info["download_url"]
@@ -1579,6 +1583,7 @@ async def actual_handle_forwarded_media(client, message: Message, status_msg=Non
             )
             if not success:
                 await status_msg.edit_text(f"❌ ডাউনলোড ব্যর্থ: {result}")
+                all_failures.append(f"❌ ডাউনলোড ব্যর্থ: {file_name} ({result})")
                 continue
 
             await status_msg.edit_text(
@@ -1597,6 +1602,7 @@ async def actual_handle_forwarded_media(client, message: Message, status_msg=Non
             posted_channels += ok_count
 
             if fail_list:
+                all_failures.extend(fail_list)
                 for fm in fail_list:
                     print(fm, flush=True)
 
@@ -1605,11 +1611,26 @@ async def actual_handle_forwarded_media(client, message: Message, status_msg=Non
                 os.remove(dl_path)
 
     ch_names = ", ".join(ch["title"] for ch in channels)
-    await status_msg.edit_text(
-        f"✅ **সম্পন্ন!**\n\n"
-        f"📢 চ্যানেল: {ch_names}\n"
-        f"🎬 পোস্ট করা হয়েছে: {total_files}টি ভিডিও"
-    )
+    if posted_channels == 0:
+        err_msg = "\n".join(all_failures) if all_failures else "অজানা সমস্যা।"
+        await status_msg.edit_text(
+            f"❌ **চ্যানেল পোস্ট সম্পূর্ণ ব্যর্থ!**\n\n"
+            f"📢 চ্যানেল: {ch_names}\n"
+            f"ভুলসমূহ:\n{err_msg}"
+        )
+    elif all_failures:
+        err_msg = "\n".join(all_failures)
+        await status_msg.edit_text(
+            f"⚠️ **পোস্ট আংশিক সম্পন্ন হয়েছে!**\n\n"
+            f"📢 সফল চ্যানেল: {posted_channels}/{len(channels)}\n"
+            f"❌ ব্যর্থ হয়েছে:\n{err_msg}"
+        )
+    else:
+        await status_msg.edit_text(
+            f"✅ **সম্পন্ন!**\n\n"
+            f"📢 চ্যানেল: {ch_names}\n"
+            f"🎬 পোস্ট করা হয়েছে: {total_files}টি ভিডিও"
+        )
 
 # ══════════════════════════════════════════════════════════════════════
 # TEXT HANDLER (URL + State machine)
