@@ -275,15 +275,18 @@ def get_user_channels(user_id: int) -> list:
     data = load_channels()
     return data.get(str(user_id), [])
 
-def add_user_channel(user_id: int, channel_id, title: str) -> bool:
+def add_user_channel(user_id: int, channel_id, title: str, invite_link: str | None = None) -> bool:
     data = load_channels()
     uid = str(user_id)
     if uid not in data:
         data[uid] = []
     for ch in data[uid]:
         if str(ch["id"]) == str(channel_id):
+            if invite_link and not ch.get("invite_link"):
+                ch["invite_link"] = invite_link
+                save_channels(data)
             return False
-    data[uid].append({"id": channel_id, "title": title})
+    data[uid].append({"id": channel_id, "title": title, "invite_link": invite_link})
     save_channels(data)
     return True
 
@@ -925,69 +928,83 @@ async def post_to_channels(
         except ValueError:
             ch_id = ch["id"]
         ch_title = ch["title"]
-        try:
-            # ─── ১. প্রথমে ডাউনলোড করা ভিডিও পাঠাও ───────────────────────
-            if downloaded_video_path and os.path.exists(downloaded_video_path):
-                vid_path = await ensure_playable_video(downloaded_video_path)
-                size_mb = os.path.getsize(vid_path) / (1024 * 1024)
+        invite_link = ch.get("invite_link")
 
-                # চ্যানেল ভিডিওর জন্য থাম্বনেইল
-                ch_thumb = None
-                if FFMPEG_AVAILABLE:
-                    ch_thumb = vid_path + f"_ch_thumb_{ch_id}.jpg"
-                    try:
-                        cmd = [
-                            "ffmpeg", "-y", "-i", vid_path,
-                            "-ss", "00:00:01", "-vframes", "1",
-                            "-vf", "scale=320:-1", ch_thumb
-                        ]
-                        proc = await asyncio.create_subprocess_exec(
-                            *cmd,
-                            stdout=asyncio.subprocess.DEVNULL,
-                            stderr=asyncio.subprocess.DEVNULL,
-                        )
-                        await asyncio.wait_for(proc.communicate(), timeout=30)
-                        if not (os.path.exists(ch_thumb) and os.path.getsize(ch_thumb) > 100):
+        posted = False
+        for attempt in range(1, 3):
+            try:
+                # ─── ১. প্রথমে ডাউনলোড করা ভিডিও পাঠাও ───────────────────────
+                if downloaded_video_path and os.path.exists(downloaded_video_path):
+                    vid_path = await ensure_playable_video(downloaded_video_path)
+                    size_mb = os.path.getsize(vid_path) / (1024 * 1024)
+
+                    # চ্যানেল ভিডিওর জন্য থাম্বনেইল
+                    ch_thumb = None
+                    if FFMPEG_AVAILABLE:
+                        ch_thumb = vid_path + f"_ch_thumb_{ch_id}.jpg"
+                        try:
+                            cmd = [
+                                "ffmpeg", "-y", "-i", vid_path,
+                                "-ss", "00:00:01", "-vframes", "1",
+                                "-vf", "scale=320:-1", ch_thumb
+                            ]
+                            proc = await asyncio.create_subprocess_exec(
+                                *cmd,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await asyncio.wait_for(proc.communicate(), timeout=30)
+                            if not (os.path.exists(ch_thumb) and os.path.getsize(ch_thumb) > 100):
+                                  ch_thumb = None
+                        except Exception:
                             ch_thumb = None
-                    except Exception:
-                        ch_thumb = None
 
-                try:
+                    try:
+                        await client.send_video(
+                            chat_id=ch_id,
+                            video=vid_path,
+                            caption=f"🎬 {downloaded_video_name}\n📦 {size_mb:.2f} MB",
+                            supports_streaming=True,
+                            thumb=ch_thumb,
+                        )
+                    finally:
+                        if ch_thumb and os.path.exists(ch_thumb):
+                            os.remove(ch_thumb)
+
+                    await asyncio.sleep(1)  # flood control
+
+                # ─── ২. তারপর অরিজিনাল ইমেজ/ভিডিও পাঠাও ──────────────────────
+                if photo_file_id:
+                    await client.send_photo(
+                        chat_id=ch_id,
+                        photo=photo_file_id,
+                        caption=original_caption,
+                    )
+                elif video_file_id:
                     await client.send_video(
                         chat_id=ch_id,
-                        video=vid_path,
-                        caption=f"🎬 {downloaded_video_name}\n📦 {size_mb:.2f} MB",
+                        video=video_file_id,
+                        caption=original_caption,
                         supports_streaming=True,
-                        thumb=ch_thumb,
                     )
-                finally:
-                    if ch_thumb and os.path.exists(ch_thumb):
-                        os.remove(ch_thumb)
 
-                await asyncio.sleep(1)  # flood control
+                success_count += 1
+                posted = True
+                break
 
-            # ─── ২. তারপর অরিজিনাল ইমেজ/ভিডিও পাঠাও ──────────────────────
-            if photo_file_id:
-                await client.send_photo(
-                    chat_id=ch_id,
-                    photo=photo_file_id,
-                    caption=original_caption,
-                )
-            elif video_file_id:
-                await client.send_video(
-                    chat_id=ch_id,
-                    video=video_file_id,
-                    caption=original_caption,
-                    supports_streaming=True,
-                )
+            except Exception as e:
+                if attempt == 1 and "peer id invalid" in str(e).lower() and invite_link:
+                    try:
+                        print(f"Attempt 1 failed with PeerIdInvalid for {ch_title}. Trying to resolve via invite link...", flush=True)
+                        await client.join_chat(invite_link)
+                        await asyncio.sleep(1.5)
+                        continue
+                    except Exception as join_err:
+                        print(f"Failed to join/resolve chat via invite link: {join_err}", flush=True)
 
-            success_count += 1
-
-        except Exception as e:
-            fail_msgs.append(f"❌ {ch_title}: {str(e)}")
-            print(f"Channel post error ({ch_title}): {e}", flush=True)
-
-    return success_count, fail_msgs
+                fail_msgs.append(f"❌ {ch_title}: {str(e)}")
+                print(f"Channel post error ({ch_title}): {e}", flush=True)
+                break
 
 # ══════════════════════════════════════════════════════════════════════
 # COMMANDS
@@ -1239,9 +1256,11 @@ async def callback_handler(client, callback: CallbackQuery):
         waiting_state[user_id] = {"step": "add_channel"}
         await callback.message.edit_text(
             "📢 **চ্যানেল যোগ করুন**\n\n"
-            "দুটি উপায়ে চ্যানেল যোগ করতে পারবেন:\n\n"
-            "১. চ্যানেল থেকে যেকোনো পোস্ট **ফরওয়ার্ড** করুন\n"
-            "২. চ্যানেলের **ID** পাঠান (যেমন: `-1001234567890`)\n\n"
+            "তিনটি উপায়ে চ্যানেল যোগ করতে পারবেন:\n\n"
+            "১. চ্যানেলের **Invite Link** পাঠান (যেমন: `https://t.me/+AbCdEf...`)\n"
+            "👉 *প্রাইভেট চ্যানেলের জন্য এটি সবচেয়ে ভালো মাধ্যম।*\n\n"
+            "২. চ্যানেল থেকে যেকোনো পোস্ট **ফরওয়ার্ড** করুন\n\n"
+            "৩. চ্যানেলের **ID** পাঠান (যেমন: `-1001234567890`)\n\n"
             "⚠️ বটকে অবশ্যই চ্যানেলের Admin করতে হবে।\n"
             "বাতিল করতে /cancel লিখুন।",
             reply_markup=None,
@@ -1723,26 +1742,58 @@ async def handle_text(client, message: Message):
 
             channel_input = text.strip()
             waiting_state.pop(user_id, None)
-            try:
-                channel_id = int(channel_input)
-                title = f"Channel {channel_id}"
-            except ValueError:
-                channel_id = channel_input
-                title = channel_input
 
-            added = add_user_channel(user_id, channel_id, title)
-            if added:
-                await message.reply_text(
-                    f"✅ চ্যানেল সেভ হয়েছে!\n"
-                    f"ID: `{channel_id}`\n\n"
-                    "⚠️ নিশ্চিত করুন বটকে চ্যানেলের Admin করা হয়েছে।",
-                    reply_markup=channel_main_keyboard(user_id),
-                )
-            else:
-                await message.reply_text(
-                    "⚠️ এই চ্যানেল আগেই সেভ আছে।",
-                    reply_markup=channel_main_keyboard(user_id),
-                )
+            # তড়িঘড়ি ইনভাইট লিংক ডিটেক্ট করো
+            invite_link = None
+            if "t.me/" in channel_input:
+                invite_link = channel_input
+                if invite_link.startswith("t.me"):
+                    invite_link = "https://" + invite_link
+
+            status = await message.reply_text("🔍 লিংক/আইডি থেকে চ্যানেল তথ্য সংগ্রহ করা হচ্ছে...")
+            try:
+                # Resolve the chat from Telegram
+                # This works for invite links, usernames, and direct numeric IDs
+                chat = await client.get_chat(invite_link or channel_input)
+                channel_id = chat.id
+                title = chat.title or str(chat.id)
+
+                added = add_user_channel(user_id, channel_id, title, invite_link=invite_link)
+                if added:
+                    await status.edit_text(
+                        f"✅ **{title}** চ্যানেল সফলভাবে সেভ হয়েছে!\n"
+                        f"ID: `{channel_id}`" + (f"\nলিংক: `{invite_link}`" if invite_link else "") + "\n\n"
+                        "⚠️ নিশ্চিত করুন বটকে চ্যানেলের Admin করা হয়েছে এবং পোস্ট করার পারমিশন দেওয়া হয়েছে।",
+                        reply_markup=channel_main_keyboard(user_id)
+                    )
+                else:
+                    await status.edit_text(
+                        f"⚠️ **{title}** চ্যানেলটি আপনার তালিকায় আগেই সেভ করা আছে।",
+                        reply_markup=channel_main_keyboard(user_id)
+                    )
+            except Exception as e:
+                # Fallback to direct ID parsing if telegram resolution fails (e.g. offline, bot not admin yet)
+                try:
+                    channel_id = int(channel_input)
+                    title = f"Channel {channel_id}"
+                except ValueError:
+                    channel_id = channel_input
+                    title = channel_input
+
+                added = add_user_channel(user_id, channel_id, title, invite_link=invite_link)
+                if added:
+                    await status.edit_text(
+                        f"✅ চ্যানেল সেভ হয়েছে (সরাসরি নাম সংগ্রহ করা যায়নি)!\n"
+                        f"ID: `{channel_id}`\n\n"
+                        f"⚠️ এরর: {str(e)}\n"
+                        "নিশ্চিত করুন বটকে চ্যানেলের Admin করা হয়েছে এবং সঠিক আইডি/লিংক দিয়েছেন।",
+                        reply_markup=channel_main_keyboard(user_id)
+                    )
+                else:
+                    await status.edit_text(
+                        f"⚠️ `{channel_id}` চ্যানেলটি আপনার তালিকায় আগেই সেভ করা আছে।",
+                        reply_markup=channel_main_keyboard(user_id)
+                    )
             return
 
     # ── URL হ্যান্ডেলিং ──────────────────────────────────────────
