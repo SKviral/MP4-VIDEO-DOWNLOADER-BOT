@@ -23,9 +23,14 @@ from datetime import datetime, timezone
 import aiohttp
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from keep_alive import keep_alive
+
+# Ensure local backup directory exists
+BACKUP_TEMP_DIR = "backup_temp"
+os.makedirs(BACKUP_TEMP_DIR, exist_ok=True)
 
 print("⏳ Bot starting...", flush=True)
 
@@ -85,6 +90,58 @@ app = Client(
 
 # State tracking: { user_id: {"step": "..."} }
 waiting_state: dict = {}
+
+# ══════════════════════════════════════════════════════════════════════
+# USER TASK QUEUE SYSTEM — একটার পর একটা ফাইল সিরিয়ালি প্রসেস করার জন্য
+# ══════════════════════════════════════════════════════════════════════
+user_queues: dict[int, asyncio.Queue] = {}
+user_tasks: dict[int, asyncio.Task] = {}
+
+def get_user_queue(user_id: int, client) -> asyncio.Queue:
+    if user_id not in user_queues:
+        user_queues[user_id] = asyncio.Queue()
+        user_tasks[user_id] = asyncio.create_task(user_queue_worker(user_id, client))
+    return user_queues[user_id]
+
+async def user_queue_worker(user_id: int, client):
+    queue = user_queues[user_id]
+    while True:
+        try:
+            item = await queue.get()
+            if item is None:
+                break
+            
+            message, handler_type, status_msg = item
+            try:
+                if handler_type == "media":
+                    await actual_handle_forwarded_media(client, message, status_msg)
+                elif handler_type == "text":
+                    await actual_handle_text_url(client, message, status_msg)
+            except Exception as e:
+                print(f"Error processing item for user {user_id}: {e}", flush=True)
+                traceback.print_exc()
+            finally:
+                queue.task_done()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Worker exception for user {user_id}: {e}", flush=True)
+
+async def queue_message(client, message: Message, handler_type: str):
+    user_id = message.from_user.id
+    queue = get_user_queue(user_id, client)
+    qsize = queue.qsize()
+    
+    if qsize > 0:
+        status_msg = await message.reply_text(
+            f"⏳ আপনার অনুরোধটি কিউতে (Queue) যোগ করা হয়েছে।\n"
+            f"👥 কিউ পজিশন: **{qsize}**\n"
+            f"সিরিয়ালি প্রসেস করার জন্য অনুগ্রহ করে একটু অপেক্ষা করুন..."
+        )
+        await queue.put((message, handler_type, status_msg))
+    else:
+        await queue.put((message, handler_type, None))
+
 
 # ══════════════════════════════════════════════════════════════════════
 # FFMPEG CHECK — ভিডিও রিপেয়ারের জন্য
@@ -243,7 +300,7 @@ def delete_user_channel(user_id: int, index: int):
 def create_backup_zip() -> str:
     """সব ডেটা ফাইল একটি ZIP-এ প্যাক করো।"""
     backup_name = f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-    backup_path = f"/tmp/{backup_name}"
+    backup_path = os.path.join(BACKUP_TEMP_DIR, backup_name)
     files_to_backup = [USER_API_FILE, CHANNEL_FILE, STATS_FILE]
     with zipfile.ZipFile(backup_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for fp in files_to_backup:
@@ -263,6 +320,46 @@ def restore_from_backup(zip_path: str) -> tuple[bool, str]:
         return True, f"✅ রিস্টোর সম্পন্ন! ফাইলগুলো: {', '.join(names)}"
     except Exception as e:
         return False, f"❌ রিস্টোর ব্যর্থ: {str(e)}"
+
+# ══════════════════════════════════════════════════════════════════════
+# KEYBOARDS — BOTTOM & START INLINE
+# ══════════════════════════════════════════════════════════════════════
+MAIN_REPLY_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🔑 API Key"), KeyboardButton("📢 Channel Manage")],
+        [KeyboardButton("💾 Backup & Restore"), KeyboardButton("📊 Stats")],
+        [KeyboardButton("❓ Help"), KeyboardButton("❌ Cancel")]
+    ],
+    resize_keyboard=True,
+    placeholder="অপশন সিলেক্ট করুন বা লিংক পাঠান..."
+)
+
+START_INLINE_KEYBOARD = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("🔑 API Key", callback_data="api_menu"),
+        InlineKeyboardButton("📢 Channel", callback_data="ch_menu")
+    ],
+    [
+        InlineKeyboardButton("💾 Backup & Restore", callback_data="backup_menu"),
+        InlineKeyboardButton("📊 Stats", callback_data="stats_btn")
+    ],
+    [
+        InlineKeyboardButton("❓ Help", callback_data="help_btn"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_btn")
+    ]
+])
+
+def start_menu_text(name: str) -> str:
+    return (
+        f"🎉 স্বাগতম, **{name}**!\n\n"
+        "আমি একটি প্রিমিয়াম ভিডিও ডাউনলোডার বট। "
+        "নিচের যেকোনো ধরনের লিংক পাঠান:\n\n"
+        "🎬 ডাইরেক্ট MP4/ভিডিও লিংক\n"
+        "📦 ZIP ফাইল লিংক (ভেতরে MP4 থাকলে)\n"
+        "☁️ Terabox লিংক\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "আমি ডাউনলোড করে ভিডিও হিসেবে পাঠিয়ে দেবো। 🚀"
+    )
 
 # ══════════════════════════════════════════════════════════════════════
 # KEYBOARDS — API
@@ -401,12 +498,14 @@ async def repair_video_ffmpeg(input_path: str, output_path: str) -> bool:
     """
     if not FFMPEG_AVAILABLE:
         return False
+    
+    # ১ম চেষ্টা: শুধু রিমাক্স করা (কপি স্ট্রিম) - অত্যন্ত দ্রুত
     try:
         cmd = [
             "ffmpeg", "-y",
             "-i", input_path,
-            "-c", "copy",              # রি-এনকোড ছাড়া কপি
-            "-movflags", "+faststart", # moov atom সামনে নিয়ে আসো (streaming fix)
+            "-c", "copy",
+            "-movflags", "+faststart",
             "-avoid_negative_ts", "make_zero",
             output_path
         ]
@@ -415,18 +514,74 @@ async def repair_video_ffmpeg(input_path: str, output_path: str) -> bool:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
         if proc.returncode == 0 and os.path.exists(output_path):
             if os.path.getsize(output_path) > MIN_VIDEO_SIZE:
                 return True
-        print(f"FFmpeg error: {stderr.decode()[:500]}", flush=True)
-        return False
     except asyncio.TimeoutError:
-        print("FFmpeg timeout!", flush=True)
-        return False
+        print("FFmpeg remux copy timeout!", flush=True)
     except Exception as e:
-        print(f"FFmpeg exception: {e}", flush=True)
-        return False
+        print(f"FFmpeg remux copy exception: {e}", flush=True)
+
+    # ২য় চেষ্টা: অডিও এ্যাক (aac) এ কনভার্ট করা (অনেক MKV-তে DTS/FLAC অডিও থাকে যা MP4 সাপোর্ট করে না)
+    try:
+        print("Remux copy failed, trying with audio transcode to aac...", flush=True)
+        cmd_aac = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-strict", "experimental",
+            "-movflags", "+faststart",
+            "-avoid_negative_ts", "make_zero",
+            output_path
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_aac,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+        if proc.returncode == 0 and os.path.exists(output_path):
+            if os.path.getsize(output_path) > MIN_VIDEO_SIZE:
+                return True
+    except asyncio.TimeoutError:
+        print("FFmpeg remux audio-aac transcode timeout!", flush=True)
+    except Exception as e:
+        print(f"FFmpeg remux audio-aac transcode exception: {e}", flush=True)
+
+    # ৩য় চেষ্টা: ফাইল সাইজ যদি ১৫০ MB এর কম হয়, তাহলে ফুল ট্রান্সকোড করো (VP9/H.265 হ্যান্ডেল করতে)
+    try:
+        file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        if file_size_mb < 150:
+            print(f"Remux failed, transcoding video to h264/aac (size: {file_size_mb:.2f}MB)...", flush=True)
+            cmd_transcode = [
+                "ffmpeg", "-y",
+                "-i", input_path,
+                "-c:v", "libx264",
+                "-preset", "superfast",
+                "-crf", "26",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-avoid_negative_ts", "make_zero",
+                output_path
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_transcode,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+            if proc.returncode == 0 and os.path.exists(output_path):
+                if os.path.getsize(output_path) > MIN_VIDEO_SIZE:
+                    return True
+            print(f"FFmpeg transcode error: {stderr.decode()[:500]}", flush=True)
+    except asyncio.TimeoutError:
+        print("FFmpeg full transcode timeout!", flush=True)
+    except Exception as e:
+        print(f"FFmpeg full transcode exception: {e}", flush=True)
+
+    return False
 
 async def ensure_playable_video(path: str) -> str:
     """
@@ -435,11 +590,18 @@ async def ensure_playable_video(path: str) -> str:
     """
     if not path.lower().endswith(".mp4"):
         new_path = path.rsplit(".", 1)[0] + ".mp4"
+        if FFMPEG_AVAILABLE:
+            success = await repair_video_ffmpeg(path, new_path)
+            if success:
+                if os.path.exists(path):
+                    os.remove(path)
+                return new_path
+        # FFmpeg না থাকলে বা ব্যর্থ হলে সাধারণ রিনেম
         if os.path.exists(path):
             os.rename(path, new_path)
-        path = new_path
+        return new_path
 
-    # moov atom চেক ও faststart ঠিক করা
+    # ফাইলটি অলরেডি .mp4 হলে moov atom এবং faststart ফিক্স করো
     if FFMPEG_AVAILABLE:
         fixed_path = path + ".fixed.mp4"
         success = await repair_video_ffmpeg(path, fixed_path)
@@ -839,23 +1001,16 @@ async def start_cmd(client, message: Message):
     if str(user_id) not in all_data:
         increment_stat("total_users")
 
+    # persistent reply keyboard
     await message.reply_text(
-        f"🎉 স্বাগতম, **{name}**!\n\n"
-        "আমি একটি প্রিমিয়াম ভিডিও ডাউনলোডার বট। "
-        "নিচের যেকোনো ধরনের লিংক পাঠান:\n\n"
-        "🎬 ডাইরেক্ট MP4/ভিডিও লিংক\n"
-        "📦 ZIP ফাইল লিংক (ভেতরে MP4 থাকলে)\n"
-        "☁️ Terabox লিংক\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "📋 **কমান্ড তালিকা:**\n"
-        "/api — Terabox API Key ম্যানেজ\n"
-        "/channel — চ্যানেল ম্যানেজ\n"
-        "/backup — ডেটা ব্যাকআপ ডাউনলোড\n"
-        "/stats — বটের পরিসংখ্যান\n"
-        "/help — বিস্তারিত সাহায্য\n"
-        "/cancel — চলমান অপারেশন বাতিল\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        "আমি ডাউনলোড করে ভিডিও হিসেবে পাঠিয়ে দেবো। 🚀"
+        "👋 প্রিমিয়াম Terabox ডাউনলোডার বটে আপনাকে স্বাগতম!\nনিচের মেনু বাটনগুলো ব্যবহার করতে পারেন।",
+        reply_markup=MAIN_REPLY_KEYBOARD
+    )
+
+    # inline main menu
+    await message.reply_text(
+        start_menu_text(name),
+        reply_markup=START_INLINE_KEYBOARD
     )
 
 @app.on_message(filters.command("help"))
@@ -942,30 +1097,16 @@ async def stats_cmd(client, message: Message):
 
 @app.on_message(filters.command("backup"))
 async def backup_cmd(client, message: Message):
-    user_id = message.from_user.id
-    status = await message.reply_text("📦 ব্যাকআপ তৈরি করা হচ্ছে...")
-    try:
-        backup_path = create_backup_zip()
-        size = os.path.getsize(backup_path)
-        await status.edit_text(f"✅ ব্যাকআপ তৈরি ({format_size(size)})। পাঠানো হচ্ছে...")
-        await client.send_document(
-            chat_id=message.chat.id,
-            document=backup_path,
-            caption=(
-                "💾 **বট ডেটা ব্যাকআপ**\n\n"
-                f"🕐 সময়: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"📦 আকার: {format_size(size)}\n\n"
-                "এই ফাইলটি নিরাপদে রাখুন। "
-                "রিস্টোর করতে এই ZIP ফাইলটি আবার বটে পাঠান।"
-            ),
-            reply_to_message_id=message.id,
-        )
-        await status.delete()
-    except Exception as e:
-        await status.edit_text(f"❌ ব্যাকআপ ব্যর্থ: {str(e)}")
-    finally:
-        if "backup_path" in locals() and os.path.exists(backup_path):
-            os.remove(backup_path)
+    await message.reply_text(
+        "💾 **ব্যাকআপ ও রিস্টোর**\n\n"
+        "• **ব্যাকআপ:** আপনার সব ডেটা (API Keys, Channel List, Stats) ZIP করে ডাউনলোড করতে পারবেন।\n"
+        "• **রিস্টোর:** আগে ডাউনলোড করা ব্যাকআপ ZIP ফাইলটি বটে আপলোড দিলেই সব ডেটা রিস্টোর হয়ে যাবে।\n\n"
+        "**নিচের বাটন চাপুন:**",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬇️ ব্যাকআপ ডাউনলোড করুন", callback_data="backup_download")],
+            [InlineKeyboardButton("📤 ব্যাকআপ রিস্টোর করুন", callback_data="backup_restore_info")]
+        ])
+    )
 
 # Admin-only broadcast
 @app.on_message(filters.command("broadcast"))
@@ -1135,6 +1276,137 @@ async def callback_handler(client, callback: CallbackQuery):
             ),
         )
 
+    elif data == "start_menu":
+        name = callback.from_user.first_name or "বন্ধু"
+        await callback.message.edit_text(
+            start_menu_text(name),
+            reply_markup=START_INLINE_KEYBOARD
+        )
+
+    elif data == "backup_menu":
+        await callback.message.edit_text(
+            "💾 **ব্যাকআপ ও রিস্টোর**\n\n"
+            "• **ব্যাকআপ:** আপনার সব ডেটা (API Keys, Channel List, Stats) ZIP করে ডাউনলোড করতে পারবেন।\n"
+            "• **রিস্টোর:** আগে ডাউনলোড করা ব্যাকআপ ZIP ফাইলটি বটে আপলোড দিলেই সব ডেটা রিস্টোর হয়ে যাবে।\n\n"
+            "**কি করতে চান?**",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬇️ ব্যাকআপ ডাউনলোড করুন", callback_data="backup_download")],
+                [InlineKeyboardButton("📤 ব্যাকআপ রিস্টোর করুন", callback_data="backup_restore_info")],
+                [InlineKeyboardButton("🔙 পিছনে যান", callback_data="start_menu")]
+            ])
+        )
+
+    elif data == "backup_download":
+        status = await callback.message.reply_text("📦 ব্যাকআপ তৈরি করা হচ্ছে...")
+        try:
+            backup_path = create_backup_zip()
+            size = os.path.getsize(backup_path)
+            await status.edit_text(f"✅ ব্যাকআপ তৈরি ({format_size(size)})। পাঠানো হচ্ছে...")
+            await client.send_document(
+                chat_id=callback.message.chat.id,
+                document=backup_path,
+                caption=(
+                    "💾 **বট ডেটা ব্যাকআপ**\n\n"
+                    f"🕐 সময়: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"📦 আকার: {format_size(size)}\n\n"
+                    "এই ফাইলটি নিরাপদে রাখুন। "
+                    "রিস্টোর করতে এই ZIP ফাইলটি আবার বটে পাঠান।"
+                ),
+            )
+            await status.delete()
+        except Exception as e:
+            await status.edit_text(f"❌ ব্যাকআপ ব্যর্থ: {str(e)}")
+        finally:
+            if "backup_path" in locals() and os.path.exists(backup_path):
+                os.remove(backup_path)
+
+    elif data == "backup_restore_info":
+        await callback.message.edit_text(
+            "📤 **ব্যাকআপ রিস্টোর করার নিয়ম:**\n\n"
+            "১. আগে ডাউনলোড করা ব্যাকআপ `.zip` ফাইলটি এই চ্যাটে পাঠান/ফরওয়ার্ড করুন।\n"
+            "২. ফাইলটি পাওয়ার পর বট আপনাকে রিস্টোর কনফার্মেশন চাইবে।\n"
+            "৩. 'হ্যাঁ, রিস্টোর করুন' বাটনে ক্লিক করলেই আপনার সমস্ত ডেটা রিস্টোর হয়ে যাবে।",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 পিছনে যান", callback_data="backup_menu")]
+            ])
+        )
+
+    elif data == "stats_btn":
+        stats = load_stats()
+        all_data = load_data()
+        channel_data = load_channels()
+
+        total_users = len(all_data)
+        total_channels = sum(len(v) for v in channel_data.values())
+        total_dl = stats.get("total_downloads", 0)
+        total_bytes = stats.get("total_bytes", 0)
+
+        # আজকের স্ট্যাট
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_stats = stats.get("daily", {}).get(today, {})
+        today_dl = today_stats.get("downloads", 0)
+        today_bytes = today_stats.get("bytes", 0)
+
+        text = (
+            "📊 **বট পরিসংখ্যান**\n\n"
+            f"⏱ আপটাইম: `{uptime_str()}`\n"
+            f"👥 মোট ইউজার: `{total_users}`\n"
+            f"📢 মোট চ্যানেল: `{total_channels}`\n\n"
+            "**🔄 সর্বকালীন:**\n"
+            f"⬇️ ডাউনলোড: `{total_dl}`\n"
+            f"📦 ডেটা: `{format_size(total_bytes)}`\n\n"
+            "**📅 আজকে:**\n"
+            f"⬇️ ডাউনলোড: `{today_dl}`\n"
+            f"📦 ডেটা: `{format_size(today_bytes)}`\n\n"
+            f"🔧 FFmpeg: `{'✅ সক্রিয়' if FFMPEG_AVAILABLE else '❌ নেই'}`"
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 পিছনে যান", callback_data="start_menu")]])
+        )
+
+    elif data == "help_btn":
+        text = (
+            "📖 **বিস্তারিত সাহায্য**\n\n"
+            "**🎬 ভিডিও ডাউনলোড:**\n"
+            "যেকোনো ডাইরেক্ট MP4 বা Terabox লিংক পাঠান। "
+            "বট স্বয়ংক্রিয়ভাবে ডাউনলোড করে আপনার কাছে পাঠাবে।\n\n"
+            "**☁️ Terabox:**\n"
+            "Terabox লিংকের জন্য API Key দরকার। "
+            "xapiverse.com থেকে ফ্রিতে পাবেন। /api বা '🔑 API Key' বাটন দিয়ে সেট করুন।\n\n"
+            "**📢 চ্যানেলে অটো পোস্ট:**\n"
+            "১. /channel বা '📢 Channel Manage' বাটন দিয়ে চ্যানেল যোগ করুন\n"
+            "২. বটকে চ্যানেলের Admin করুন\n"
+            "৩. Terabox লিংকসহ ছবি/ভিডিও ফরওয়ার্ড করুন\n"
+            "বট ভিডিও ডাউনলোড করে চ্যানেলে পোস্ট করবে!\n\n"
+            "**💾 ব্যাকআপ:**\n"
+            "আপনার সব ডেটা ZIP করে ডাউনলোড করতে পারবেন। "
+            "ব্যাকআপ রিস্টোর করতে ZIP ফাইলটি সরাসরি বটে পাঠান।\n\n"
+            "**⚡ ফিচার:**\n"
+            "• ভিডিও প্লে বাগ অটো-ফিক্স (ffmpeg)\n"
+            "• স্বয়ংক্রিয় থাম্বনেইল\n"
+            "• ডাউনলোড স্পিড ও ETA দেখানো\n"
+            "• একাধিক API Key সাপোর্ট\n"
+            "• ZIP ফাইল থেকে ভিডিও বের করা"
+        )
+        await callback.message.edit_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 পিছনে যান", callback_data="start_menu")]])
+        )
+
+    elif data == "cancel_btn":
+        if user_id in waiting_state:
+            waiting_state.pop(user_id, None)
+            await callback.message.edit_text(
+                "❌ চলমান অপারেশন বাতিল করা হয়েছে।",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 পিছনে যান", callback_data="start_menu")]])
+            )
+        else:
+            await callback.message.edit_text(
+                "⚠️ কোনো সক্রিয় অপারেশন নেই।",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 পিছনে যান", callback_data="start_menu")]])
+            )
+
     await callback.answer()
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1159,7 +1431,7 @@ async def handle_document(client, message: Message):
             ]),
         )
         # ZIP ডাউনলোড করে রাখো
-        zip_tmp = f"/tmp/restore_{user_id}_{message.id}.zip"
+        zip_tmp = os.path.join(BACKUP_TEMP_DIR, f"restore_{user_id}_{message.id}.zip")
         await message.download(zip_tmp)
         return
 
@@ -1172,7 +1444,7 @@ async def handle_document(client, message: Message):
 async def restore_callback(client, callback: CallbackQuery):
     user_id = callback.from_user.id
     msg_id = callback.data.split(":")[1]
-    zip_tmp = f"/tmp/restore_{user_id}_{msg_id}.zip"
+    zip_tmp = os.path.join(BACKUP_TEMP_DIR, f"restore_{user_id}_{msg_id}.zip")
 
     if not os.path.exists(zip_tmp):
         await callback.message.edit_text("❌ ফাইলটি আর নেই। আবার পাঠান।")
@@ -1180,16 +1452,21 @@ async def restore_callback(client, callback: CallbackQuery):
 
     success, msg = restore_from_backup(zip_tmp)
     await callback.message.edit_text(msg)
-    os.remove(zip_tmp)
+    if os.path.exists(zip_tmp):
+        os.remove(zip_tmp)
     await callback.answer()
 
 @app.on_callback_query(filters.regex(r"^restore_cancel$"))
 async def restore_cancel(client, callback: CallbackQuery):
     user_id = callback.from_user.id
     # temp ফাইল মুছো
-    for f in os.listdir("/tmp"):
-        if f.startswith(f"restore_{user_id}_"):
-            os.remove(f"/tmp/{f}")
+    if os.path.exists(BACKUP_TEMP_DIR):
+        for f in os.listdir(BACKUP_TEMP_DIR):
+            if f.startswith(f"restore_{user_id}_"):
+                try:
+                    os.remove(os.path.join(BACKUP_TEMP_DIR, f))
+                except Exception:
+                    pass
     await callback.message.edit_text("❌ রিস্টোর বাতিল করা হয়েছে।")
     await callback.answer()
 
@@ -1202,7 +1479,7 @@ async def handle_forwarded_media(client, message: Message):
         return
     user_id = message.from_user.id
 
-    # চ্যানেল যোগের মোডে আছে?
+    # চ্যানেল যোগের মোডে আছে? (এটি সরাসরি প্রসেস হবে, কিউতে যাবে না)
     if user_id in waiting_state and waiting_state[user_id].get("step") == "add_channel":
         waiting_state.pop(user_id, None)
         fwd_chat = message.forward_from_chat
@@ -1235,18 +1512,40 @@ async def handle_forwarded_media(client, message: Message):
     if not terabox_url:
         return  # Terabox লিংক নেই
 
-    channels = get_user_channels(user_id)
-    if not channels:
-        await message.reply_text(
-            "❌ কোনো চ্যানেল সেভ নেই।\n"
-            "/channel দিয়ে চ্যানেল যোগ করুন।"
-        )
+    # কিউতে যোগ করো
+    await queue_message(client, message, "media")
+
+async def actual_handle_forwarded_media(client, message: Message, status_msg=None):
+    user_id = message.from_user.id
+    caption = message.caption or ""
+    terabox_url = extract_terabox_url(caption)
+    if not terabox_url:
         return
 
-    status_msg = await message.reply_text(
-        f"📢 Terabox পোস্ট শনাক্ত হয়েছে!\n"
-        f"🔄 {len(channels)}টি চ্যানেলে পোস্ট করা হবে..."
-    )
+    channels = get_user_channels(user_id)
+    if not channels:
+        if status_msg:
+            await status_msg.edit_text(
+                "❌ কোনো চ্যানেল সেভ নেই।\n"
+                "/channel দিয়ে চ্যানেল যোগ করুন।"
+            )
+        else:
+            await message.reply_text(
+                "❌ কোনো চ্যানেল সেভ নেই।\n"
+                "/channel দিয়ে চ্যানেল যোগ করুন।"
+            )
+        return
+
+    if not status_msg:
+        status_msg = await message.reply_text(
+            f"📢 Terabox পোস্ট শনাক্ত হয়েছে!\n"
+            f"🔄 {len(channels)}টি চ্যানেলে পোস্ট করা হবে..."
+        )
+    else:
+        await status_msg.edit_text(
+            f"📢 Terabox পোস্ট শনাক্ত হয়েছে!\n"
+            f"🔄 {len(channels)}টি চ্যানেলে পোস্ট করা হবে..."
+        )
 
     uid = f"{user_id}_{int(time.time())}"
     active_key = get_active_key(user_id) or DEFAULT_TERABOX_KEY
@@ -1326,6 +1625,22 @@ async def handle_text(client, message: Message):
         return
     user_id = message.from_user.id
     text = message.text.strip()
+
+    # ── persistent bottom menu buttons handling ─────────────────
+    if text in ["🔑 API Key", "📢 Channel Manage", "💾 Backup & Restore", "📊 Stats", "❓ Help", "❌ Cancel"]:
+        if text == "🔑 API Key":
+            await api_cmd(client, message)
+        elif text == "📢 Channel Manage":
+            await channel_cmd(client, message)
+        elif text == "💾 Backup & Restore":
+            await backup_cmd(client, message)
+        elif text == "📊 Stats":
+            await stats_cmd(client, message)
+        elif text == "❓ Help":
+            await help_cmd(client, message)
+        elif text == "❌ Cancel":
+            await cancel_cmd(client, message)
+        return
 
     # ── Waiting state ─────────────────────────────────────────────
     if user_id in waiting_state:
@@ -1422,8 +1737,17 @@ async def handle_text(client, message: Message):
         )
         return
 
-    url = text
-    status_msg = await message.reply_text("⏳ লিংকটি চেক করা হচ্ছে...")
+    # কিউতে যোগ করো
+    await queue_message(client, message, "text")
+
+async def actual_handle_text_url(client, message: Message, status_msg=None):
+    user_id = message.from_user.id
+    url = message.text.strip()
+
+    if not status_msg:
+        status_msg = await message.reply_text("⏳ লিংকটি চেক করা হচ্ছে...")
+    else:
+        await status_msg.edit_text("⏳ লিংকটি চেক করা হচ্ছে...")
 
     uid      = f"{user_id}_{int(time.time())}"
     temp_dir = f"temp_{uid}"
