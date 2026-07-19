@@ -737,6 +737,73 @@ async def get_terabox_info(url: str, api_key: str):
     except Exception as e:
         return False, f"Terabox API এরর: {str(e)}"
 
+def get_sorted_labels(keys_dict: dict) -> list[str]:
+    # Sort labels numerically if possible, otherwise alphabetically
+    def key_func(label):
+        try:
+            return (0, int(label), label)
+        except ValueError:
+            return (1, 0, label)
+    return sorted(keys_dict.keys(), key=key_func)
+
+async def get_terabox_info_with_rotation(user_id: int, url: str, status_msg=None, original_prefix: str = ""):
+    udata = get_user_data(user_id)
+    keys = udata.get("keys", {})
+    
+    if not keys:
+        ok, info = await get_terabox_info(url, DEFAULT_TERABOX_KEY)
+        return ok, info, "🌐 ডিফল্ট API"
+
+    max_attempts = len(keys)
+    for attempt in range(max_attempts):
+        active_label = udata.get("active")
+        active_key = keys.get(active_label)
+        if not active_key:
+            sorted_labels = get_sorted_labels(keys)
+            active_label = sorted_labels[0]
+            active_key = keys[active_label]
+            udata["active"] = active_label
+            save_user_data(user_id, udata)
+            
+        ok, info = await get_terabox_info(url, active_key)
+        if ok:
+            return True, info, active_label
+            
+        error_msg = str(info)
+        is_balance_issue = (
+            "insufficient balance" in error_msg.lower()
+            or "add funds" in error_msg.lower()
+            or "wallet" in error_msg.lower()
+        )
+        
+        if is_balance_issue and len(keys) > 1:
+            sorted_labels = get_sorted_labels(keys)
+            try:
+                idx = sorted_labels.index(active_label)
+            except ValueError:
+                idx = -1
+            next_idx = (idx + 1) % len(sorted_labels)
+            new_label = sorted_labels[next_idx]
+            
+            udata["active"] = new_label
+            save_user_data(user_id, udata)
+            
+            print(f"User {user_id}: API key '{active_label}' has insufficient balance. Rotating to '{new_label}'.", flush=True)
+            if status_msg:
+                try:
+                    await status_msg.edit_text(
+                        f"{original_prefix}"
+                        f"⚠️ API key '**{active_label}**' এ ব্যালেন্স শেষ!\n"
+                        f"🔄 অটোমেটিক পরিবর্তন করে API key '**{new_label}**' দিয়ে চেষ্টা করা হচ্ছে..."
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(2.5)  # Give user time to read
+        else:
+            return False, info, active_label
+            
+    return False, "আপনার সব সেভ করা API Key এর ব্যালেন্স শেষ হয়ে গেছে!", active_label
+
 # ══════════════════════════════════════════════════════════════════════
 # ZIP HELPERS
 # ══════════════════════════════════════════════════════════════════════
@@ -1624,7 +1691,6 @@ async def actual_handle_forwarded_media(client, message: Message, status_msg=Non
         await status_msg.edit_text(msg_text)
 
     uid = f"{user_id}_{int(time.time())}"
-    active_key = get_active_key(user_id) or DEFAULT_TERABOX_KEY
 
     # ১. সবগুলো লিংক থেকে ফাইল ইনফো কালেক্ট করো
     all_files_info = []
@@ -1634,7 +1700,9 @@ async def actual_handle_forwarded_media(client, message: Message, status_msg=Non
                 f"🔗 লিংক: {display_urls}\n\n"
                 f"🔍 লিংক {u_idx}/{len(terabox_urls)} এর তথ্য সংগ্রহ করা হচ্ছে..."
             )
-            ok, info = await get_terabox_info(t_url, active_key)
+            ok, info, used_label = await get_terabox_info_with_rotation(
+                user_id, t_url, status_msg, f"🔗 লিংক: {display_urls}\n\n"
+            )
             if not ok:
                 await status_msg.edit_text(
                     f"🔗 লিংক: {display_urls}\n\n"
@@ -1933,7 +2001,6 @@ async def actual_handle_text_url(client, message: Message, status_msg=None):
     try:
         # ── Terabox ──────────────────────────────────────────────
         if is_terabox_url(url):
-            active_key = get_active_key(user_id) or DEFAULT_TERABOX_KEY
             udata = get_user_data(user_id)
             active_label = udata.get("active")
             key_label = f"🔑 {active_label}" if get_active_key(user_id) else "🌐 ডিফল্ট API"
@@ -1945,7 +2012,9 @@ async def actual_handle_text_url(client, message: Message, status_msg=None):
                 "🔍 তথ্য সংগ্রহ করা হচ্ছে..."
             )
 
-            ok, info = await get_terabox_info(url, active_key)
+            ok, info, used_label = await get_terabox_info_with_rotation(
+                user_id, url, status_msg, f"🔗 লিংক: {url}\n\n"
+            )
             if not ok:
                 await status_msg.edit_text(
                     f"🔗 লিংক: {url}\n\n"
