@@ -509,6 +509,48 @@ def extract_all_terabox_urls(text: str) -> list[str]:
                 urls.append(word)
     return urls
 
+def parse_channel_target(inp: str):
+    """
+    Parses channel input string into (chat_target, invite_link_if_any).
+    """
+    inp = str(inp).strip()
+    
+    # 1. Numeric ID
+    if inp.lstrip("-").isdigit():
+        val = int(inp)
+        if val > 0 and str(val).startswith("100"):
+            val = -val
+        elif val > 0:
+            val = int(f"-100{val}")
+        return val, None
+
+    # 2. Private invite link (https://t.me/+... or t.me/joinchat/...)
+    if "joinchat/" in inp or "/+" in inp or "t.me/+" in inp:
+        url = inp
+        if url.startswith("t.me"):
+            url = "https://" + url
+        return url, url
+
+    # 3. Public t.me or telegram.me link (e.g. https://t.me/hkvideodw)
+    if "t.me/" in inp or "telegram.me/" in inp or "telegram.dog/" in inp:
+        parts = inp.rstrip("/").split("/")
+        last_part = parts[-1].strip()
+        if last_part.startswith("@"):
+            last_part = last_part[1:]
+        if last_part:
+            return last_part, f"https://t.me/{last_part}"
+
+    # 4. Username starting with @
+    if inp.startswith("@"):
+        username = inp[1:]
+        return username, f"https://t.me/{username}"
+
+    # 5. Plain username string (alphanumeric + underscore)
+    if re.match(r'^[a-zA-Z0-9_]+$', inp):
+        return inp, f"https://t.me/{inp}"
+
+    return inp, None
+
 
 def format_size(size_bytes: int) -> str:
     if size_bytes == 0:
@@ -1042,24 +1084,25 @@ async def post_to_channels(
     fail_msgs = []
 
     for ch in channels:
-        try:
-            ch_id = int(ch["id"])
-        except ValueError:
-            ch_id = ch["id"]
+        ch_raw_id = ch["id"]
         ch_title = ch["title"]
-        invite_link = ch.get("invite_link")
+        stored_invite = ch.get("invite_link")
+
+        # Parse and clean target peer ID/username and invite link
+        parsed_target, parsed_link = parse_channel_target(ch_raw_id)
+        invite_link = stored_invite or parsed_link
 
         # ১. আগে চ্যানেল পিয়ার (Access Hash) ওয়ার্মআপ/রিসলভ করার চেষ্টা করো
-        target_peer = ch_id
+        target_peer = parsed_target
         try:
-            if invite_link:
+            if invite_link and ("joinchat/" in str(invite_link) or "/+" in str(invite_link)):
                 chat_info = await client.get_chat(invite_link)
                 target_peer = chat_info.id
             else:
-                chat_info = await client.get_chat(ch_id)
+                chat_info = await client.get_chat(parsed_target)
                 target_peer = chat_info.id
         except Exception as pe_err:
-            print(f"Pre-resolving peer for {ch_title} ({ch_id}) warning: {pe_err}", flush=True)
+            print(f"Pre-resolving peer for {ch_title} ({ch_raw_id}) warning: {pe_err}", flush=True)
 
         posted = False
         for attempt in range(1, 3):
@@ -1076,7 +1119,7 @@ async def post_to_channels(
                             # চ্যানেল ভিডিওর জন্য থাম্বনেইল
                             ch_thumb = None
                             if FFMPEG_AVAILABLE:
-                                ch_thumb = vid_path + f"_ch_thumb_{ch_id}.jpg"
+                                ch_thumb = vid_path + f"_ch_thumb_{ch_raw_id}.jpg"
                                 try:
                                     cmd = [
                                         "ffmpeg", "-y", "-i", vid_path,
@@ -1129,16 +1172,16 @@ async def post_to_channels(
 
             except Exception as e:
                 err_str = str(e).lower()
-                if attempt == 1 and ("peer id invalid" in err_str or "channel_invalid" in err_str or "peer_id_invalid" in err_str):
+                if attempt == 1 and ("peer id invalid" in err_str or "channel_invalid" in err_str or "peer_id_invalid" in err_str or "username_invalid" in err_str):
                     try:
-                        print(f"Attempt 1 failed with PeerIdInvalid for {ch_title}. Resolving chat...", flush=True)
-                        if invite_link:
+                        print(f"Attempt 1 failed with {e} for {ch_title}. Resolving chat...", flush=True)
+                        if invite_link and ("joinchat/" in str(invite_link) or "/+" in str(invite_link)):
                             await client.join_chat(invite_link)
                             await asyncio.sleep(1)
                             resolved_chat = await client.get_chat(invite_link)
                             target_peer = resolved_chat.id
                         else:
-                            resolved_chat = await client.get_chat(ch_id)
+                            resolved_chat = await client.get_chat(parsed_target)
                             target_peer = resolved_chat.id
                         continue
                     except Exception as join_err:
@@ -1939,18 +1982,13 @@ async def handle_text(client, message: Message):
             channel_input = text.strip()
             waiting_state.pop(user_id, None)
 
-            # তড়িঘড়ি ইনভাইট লিংক ডিটেক্ট করো
-            invite_link = None
-            if "t.me/" in channel_input:
-                invite_link = channel_input
-                if invite_link.startswith("t.me"):
-                    invite_link = "https://" + invite_link
+            # Clean input to get proper target and invite link
+            parsed_target, invite_link = parse_channel_target(channel_input)
 
             status = await message.reply_text("🔍 লিংক/আইডি থেকে চ্যানেল তথ্য সংগ্রহ করা হচ্ছে...")
             try:
-                # Resolve the chat from Telegram
-                # This works for invite links, usernames, and direct numeric IDs
-                chat = await client.get_chat(invite_link or channel_input)
+                # Resolve the chat from Telegram using parsed_target
+                chat = await client.get_chat(parsed_target)
                 channel_id = chat.id
                 title = chat.title or str(chat.id)
 
@@ -1968,20 +2006,16 @@ async def handle_text(client, message: Message):
                         reply_markup=channel_main_keyboard(user_id)
                     )
             except Exception as e:
-                # Fallback to direct ID parsing if telegram resolution fails (e.g. offline, bot not admin yet)
-                try:
-                    channel_id = int(channel_input)
-                    title = f"Channel {channel_id}"
-                except ValueError:
-                    channel_id = channel_input
-                    title = channel_input
+                # Fallback if telegram resolution fails (e.g. offline, bot not admin yet)
+                channel_id = parsed_target
+                title = f"Channel {parsed_target}" if isinstance(parsed_target, int) else str(parsed_target)
 
                 added = add_user_channel(user_id, channel_id, title, invite_link=invite_link)
                 if added:
                     await status.edit_text(
-                        f"✅ চ্যানেল সেভ হয়েছে (সরাসরি নাম সংগ্রহ করা যায়নি)!\n"
-                        f"ID: `{channel_id}`\n\n"
-                        f"⚠️ এরর: {str(e)}\n"
+                        f"✅ চ্যানেল সেভ হয়েছে!\n"
+                        f"ID / Username: `{channel_id}`\n\n"
+                        f"⚠️ তথ্য: {str(e)}\n"
                         "নিশ্চিত করুন বটকে চ্যানেলের Admin করা হয়েছে এবং সঠিক আইডি/লিংক দিয়েছেন।",
                         reply_markup=channel_main_keyboard(user_id)
                     )
