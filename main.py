@@ -1049,6 +1049,18 @@ async def post_to_channels(
         ch_title = ch["title"]
         invite_link = ch.get("invite_link")
 
+        # ১. আগে চ্যানেল পিয়ার (Access Hash) ওয়ার্মআপ/রিসলভ করার চেষ্টা করো
+        target_peer = ch_id
+        try:
+            if invite_link:
+                chat_info = await client.get_chat(invite_link)
+                target_peer = chat_info.id
+            else:
+                chat_info = await client.get_chat(ch_id)
+                target_peer = chat_info.id
+        except Exception as pe_err:
+            print(f"Pre-resolving peer for {ch_title} ({ch_id}) warning: {pe_err}", flush=True)
+
         posted = False
         for attempt in range(1, 3):
             try:
@@ -1084,7 +1096,7 @@ async def post_to_channels(
 
                             try:
                                 await client.send_video(
-                                    chat_id=ch_id,
+                                    chat_id=target_peer,
                                     video=vid_path,
                                     caption=f"🎬 {vid_name}\n📦 {size_mb:.2f} MB",
                                     supports_streaming=True,
@@ -1099,13 +1111,13 @@ async def post_to_channels(
                 # ─── ২. তারপর অরিজিনাল ইমেজ/ভিডিও পাঠাও (থাম্বনেইল) ──────────────────────
                 if photo_file_id:
                     await client.send_photo(
-                        chat_id=ch_id,
+                        chat_id=target_peer,
                         photo=photo_file_id,
                         caption=original_caption,
                     )
                 elif video_file_id:
                     await client.send_video(
-                        chat_id=ch_id,
+                        chat_id=target_peer,
                         video=video_file_id,
                         caption=original_caption,
                         supports_streaming=True,
@@ -1116,14 +1128,21 @@ async def post_to_channels(
                 break
 
             except Exception as e:
-                if attempt == 1 and "peer id invalid" in str(e).lower() and invite_link:
+                err_str = str(e).lower()
+                if attempt == 1 and ("peer id invalid" in err_str or "channel_invalid" in err_str or "peer_id_invalid" in err_str):
                     try:
-                        print(f"Attempt 1 failed with PeerIdInvalid for {ch_title}. Trying to resolve via invite link...", flush=True)
-                        await client.join_chat(invite_link)
-                        await asyncio.sleep(1.5)
+                        print(f"Attempt 1 failed with PeerIdInvalid for {ch_title}. Resolving chat...", flush=True)
+                        if invite_link:
+                            await client.join_chat(invite_link)
+                            await asyncio.sleep(1)
+                            resolved_chat = await client.get_chat(invite_link)
+                            target_peer = resolved_chat.id
+                        else:
+                            resolved_chat = await client.get_chat(ch_id)
+                            target_peer = resolved_chat.id
                         continue
                     except Exception as join_err:
-                        print(f"Failed to join/resolve chat via invite link: {join_err}", flush=True)
+                        print(f"Failed to resolve chat: {join_err}", flush=True)
 
                 fail_msgs.append(f"❌ {ch_title}: {str(e)}")
                 print(f"Channel post error ({ch_title}): {e}", flush=True)
