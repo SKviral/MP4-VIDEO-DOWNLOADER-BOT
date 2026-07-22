@@ -1129,6 +1129,8 @@ async def post_to_channels(
                 print(f"Channel post error ({ch_title}): {e}", flush=True)
                 break
 
+    return success_count, fail_msgs
+
 # ══════════════════════════════════════════════════════════════════════
 # COMMANDS
 # ══════════════════════════════════════════════════════════════════════
