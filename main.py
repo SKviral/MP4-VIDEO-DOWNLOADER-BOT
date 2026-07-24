@@ -70,7 +70,7 @@ VIDEO_EXTENSIONS = (".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv", ".m4v", ".t
 USER_API_FILE    = "user_apis.json"
 CHANNEL_FILE     = "user_channels.json"
 STATS_FILE       = "bot_stats.json"
-TERABOX_API_URL  = "https://xapiverse.com/api/terabox"
+TERABOX_API_URL  = "https://xapiverse.com/api/terabox-pro"
 BOT_START_TIME   = time.time()
 
 TERABOX_DOMAINS = (
@@ -729,10 +729,10 @@ async def get_terabox_info(url: str, api_key: str):
             msg = data.get("message") or data.get("error") or "API এরর।"
             if "subscribe" in str(msg).lower():
                 msg = (
-                    "আপনার API Key এ Terabox API সাবস্ক্রাইব করা নেই।\n\n"
+                    "আপনার API Key এ TeraBox API Pro ⚡️ সাবস্ক্রাইব করা নেই।\n\n"
                     "সমাধান:\n"
                     "১. xapiverse.com এ লগিন করুন\n"
-                    "২. Terabox API খুঁজে Subscribe করুন\n"
+                    "২. TeraBox API Pro ⚡️ খুঁজে Subscribe করুন\n"
                     "৩. তারপর আবার চেষ্টা করুন"
                 )
             return False, str(msg)
@@ -742,8 +742,8 @@ async def get_terabox_info(url: str, api_key: str):
             results = []
             for item in file_list:
                 dl_url = (
-                    item.get("normal_dlink") or item.get("dlink")
-                    or item.get("download_url") or item.get("url") or item.get("link")
+                    item.get("fast_dlink") or item.get("normal_dlink") or item.get("dlink")
+                    or item.get("download_url") or item.get("stream_url") or item.get("url") or item.get("link")
                 )
                 zip_url = item.get("zip_dlink") or item.get("zip_url")
                 fname = (
@@ -762,8 +762,8 @@ async def get_terabox_info(url: str, api_key: str):
                 return True, results
 
         dl_url = (
-            data.get("normal_dlink") or data.get("dlink")
-            or data.get("download_url") or data.get("url") or data.get("link")
+            data.get("fast_dlink") or data.get("normal_dlink") or data.get("dlink")
+            or data.get("download_url") or data.get("stream_url") or data.get("url") or data.get("link")
         )
         if dl_url:
             fname = data.get("name") or data.get("file_name") or "terabox_video.mp4"
@@ -1425,9 +1425,9 @@ async def callback_handler(client, callback: CallbackQuery):
 
     elif data == "api_help":
         await callback.message.edit_text(
-            "❓ **Terabox API Key কোথায় পাবেন?**\n\n"
-            "১. [xapiverse.com](https://xapiverse.com) এ যান\n"
-            "২. রেজিস্ট্রেশন করুন\n"
+            "❓ **TeraBox API Pro Key কোথায় পাবেন?**\n\n"
+            "১. [xapiverse.com](https://xapiverse.com/apis/terabox-pro) এ যান\n"
+            "২. রেজিস্ট্রেশন ও TeraBox API Pro ⚡️ এ Subscribe করুন\n"
             "৩. Dashboard থেকে API Key কপি করুন\n"
             "৪. বটে /api দিয়ে **➕ নতুন API Key যোগ করুন** চাপুন",
             reply_markup=back_api_keyboard(),
